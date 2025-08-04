@@ -16,13 +16,10 @@ deployment_secrets.toml
 /logs
 
 # Ignore all env files
-.env*
+.env.*
 # Except for the templates and running network env files
 !.env.broker-template
 !.env.localnet-template
-!.env.eth-sepolia
-!.env.base-sepolia
-!.env.base
 
 # Ignore broker config file(s)
 *broker*.toml
