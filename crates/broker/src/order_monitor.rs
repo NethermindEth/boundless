@@ -471,7 +471,8 @@ where
                 self.skip_order(&order, "expired").await;
             } else if is_target_time_reached(&order, current_block_timestamp) {
                 tracing::info!("Request 0x{:x} was locked by another prover but expired unfulfilled, setting status to pending proving", order.request.id);
-                candidate_orders.push(order);
+                // candidate_orders.push(order);
+                self.skip_order(&order, "locked by another prover").await;
             }
         }
 
