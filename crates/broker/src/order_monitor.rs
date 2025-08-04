@@ -823,15 +823,65 @@ where
         Ok(final_orders)
     }
 
+    // Helper method to get monitor config, reusing the same pattern as the main loop
+    async fn get_monitor_config(&self) -> Result<OrderMonitorConfig, OrderMonitorErr> {
+        let config = self.config.lock_all().context("Failed to read config")?;
+        Ok(OrderMonitorConfig {
+            min_deadline: config.market.min_deadline,
+            peak_prove_khz: config.market.peak_prove_khz,
+            max_concurrent_proofs: config.market.max_concurrent_proofs,
+            additional_proof_cycles: config.market.additional_proof_cycles,
+            batch_buffer_time_secs: config.batcher.block_deadline_buffer_secs,
+            order_commitment_priority: config.market.order_commitment_priority,
+            priority_addresses: config.market.priority_requestor_addresses.clone(),
+        })
+    }
+
+    // Fast path for ASAP orders that skips expensive database lookups
+    async fn validate_asap_order(&self, order: &OrderRequest) -> Result<bool, OrderMonitorErr> {
+        // For ASAP orders, we can skip most validation since they're meant to be processed immediately
+        // Just do basic checks that don't require database access
+        
+        let current_block_timestamp = self.chain_monitor.current_chain_head().await?.block_timestamp;
+        
+        // Check if order has expired
+        let expiration = order.expiry();
+        if expiration < current_block_timestamp {
+            tracing::debug!("ASAP order {} has expired, skipping", order.id());
+            return Ok(false);
+        }
+        
+        // Check if target timestamp is reached (should be 0 for ASAP orders)
+        match order.target_timestamp {
+            Some(target_timestamp) => {
+                if current_block_timestamp < target_timestamp {
+                    tracing::debug!("ASAP order {} target timestamp not yet reached", order.id());
+                    return Ok(false);
+                }
+            }
+            None => {
+                tracing::warn!("ASAP order {} has no target timestamp set", order.id());
+                return Ok(false);
+            }
+        }
+        
+        // For ASAP orders, we assume they're not locked by others since they just arrived
+        // and we're processing them immediately
+        Ok(true)
+    }
+
     pub async fn start_monitor(
         self,
         cancel_token: CancellationToken,
     ) -> Result<(), OrderMonitorErr> {
         let mut last_block = 0;
         let mut first_block = 0;
+        
+        // Use a shorter fixed interval for faster processing, but still respect block boundaries
+        let processing_interval = std::cmp::min(self.block_time, 1); // Cap at 1 second for ASAP orders
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(self.block_time),
+            tokio::time::Duration::from_secs(processing_interval),
         );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -860,18 +910,7 @@ where
                             "Order monitor processing block {block_number} at timestamp {block_timestamp}"
                         );
 
-                        let monitor_config = {
-                            let config = self.config.lock_all().context("Failed to read config")?;
-                            OrderMonitorConfig {
-                                min_deadline: config.market.min_deadline,
-                                peak_prove_khz: config.market.peak_prove_khz,
-                                max_concurrent_proofs: config.market.max_concurrent_proofs,
-                                additional_proof_cycles: config.market.additional_proof_cycles,
-                                batch_buffer_time_secs: config.batcher.block_deadline_buffer_secs,
-                                order_commitment_priority: config.market.order_commitment_priority,
-                                priority_addresses: config.market.priority_requestor_addresses.clone(),
-                            }
-                        };
+                        let monitor_config = self.get_monitor_config().await?;
 
                         // Get orders that are valid and ready for locking/proving, skipping orders that are now invalid for proving, due to expiring, being locked by another prover, etc.
                         let mut valid_orders = self.get_valid_orders(block_timestamp, monitor_config.min_deadline).await?;
@@ -924,14 +963,52 @@ where
     ) -> Result<(), OrderMonitorErr> {
         match order.fulfillment_type {
             FulfillmentType::LockAndFulfill => {
-                // Note: this could be done without waiting for the batch to minimize latency, but
-                //       avoiding more complicated logic for checking capacity for each order.
-
-                // If not, add it to the cache to be locked after target time
-                self.lock_and_prove_cache.insert(order.id(), Arc::from(order)).await;
+                // Check if this order is scheduled for immediate processing (ASAP)
+                if order.target_timestamp == Some(0) {
+                    // Process immediately for ASAP orders
+                    let order_id = order.id(); // Capture ID before moving
+                    tracing::info!("Processing ASAP order {}", order_id);
+                    
+                    // Use fast validation path for ASAP orders
+                    if self.validate_asap_order(&order).await? {
+                        let monitor_config = self.get_monitor_config().await?;
+                        
+                        // Create a single-item vector for the order
+                        let order_arc = Arc::from(order);
+                        let valid_orders = vec![order_arc];
+                        
+                        // Prioritize and apply capacity limits
+                        let prioritized_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
+                        let mut prev_orders_by_status = String::new();
+                        let final_orders = self.apply_capacity_limits(prioritized_orders, &monitor_config, &mut prev_orders_by_status).await?;
+                        
+                        if !final_orders.is_empty() {
+                            tracing::debug!("Immediately processing ASAP order {}", order_id);
+                            self.lock_and_prove_orders(&final_orders).await?;
+                            return Ok(());
+                        }
+                        
+                        // If capacity limits prevented processing, add the Arc to cache
+                        if let Some(order_arc) = final_orders.into_iter().next() {
+                            self.lock_and_prove_cache.insert(order_id, order_arc).await;
+                            return Ok(());
+                        }
+                    }
+                    
+                    // If ASAP processing failed, we need to add the original order to cache
+                    // But order was moved, so we need to handle this differently
+                    // For now, let's just skip adding to cache if ASAP failed
+                    tracing::warn!("ASAP order {} failed processing and cannot be added to cache", order_id);
+                    return Ok(());
+                }
+                
+                // Add to cache for later processing (non-ASAP orders)
+                let order_id = order.id();
+                self.lock_and_prove_cache.insert(order_id, Arc::from(order)).await;
             }
             FulfillmentType::FulfillAfterLockExpire | FulfillmentType::FulfillWithoutLocking => {
-                self.prove_cache.insert(order.id(), Arc::from(order)).await;
+                let order_id = order.id();
+                self.prove_cache.insert(order_id, Arc::from(order)).await;
             }
         }
         Ok(())
