@@ -965,29 +965,31 @@ where
                     // Create a single-item vector for the order
                     let order_arc = Arc::from(order);
                     let valid_orders = vec![order_arc];
+                    self.lock_and_prove_orders(&valid_orders).await?;
+                    return Ok(());
 
                     // // Prioritize and apply capacity limits
                     // let prioritized_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
-                    let mut prev_orders_by_status = String::new();
-                    let final_orders = self.apply_capacity_limits(valid_orders, &monitor_config, &mut prev_orders_by_status).await?;
+                    // let mut prev_orders_by_status = String::new();
+                    // let final_orders = self.apply_capacity_limits(valid_orders, &monitor_config, &mut prev_orders_by_status).await?;
                     
-                    if !final_orders.is_empty() {
-                        tracing::debug!("Immediately processing ASAP order {}", order_id);
-                        self.lock_and_prove_orders(&final_orders).await?;
-                        return Ok(());
-                    }
+                    // if !final_orders.is_empty() {
+                    //     tracing::debug!("Immediately processing ASAP order {}", order_id);
+                    //     self.lock_and_prove_orders(&final_orders).await?;
+                    //     return Ok(());
+                    // }
                     
-                    // If capacity limits prevented processing, add the Arc to cache
-                    if let Some(order_arc) = final_orders.into_iter().next() {
-                        self.lock_and_prove_cache.insert(order_id, order_arc).await;
-                        return Ok(());
-                    }
+                    // // If capacity limits prevented processing, add the Arc to cache
+                    // if let Some(order_arc) = final_orders.into_iter().next() {
+                    //     self.lock_and_prove_cache.insert(order_id, order_arc).await;
+                    //     return Ok(());
+                    // }
                     
-                    // If ASAP processing failed, we need to add the original order to cache
-                    // But order was moved, so we need to handle this differently
-                    // For now, let's just skip adding to cache if ASAP failed
-                    tracing::warn!("ASAP order {} failed processing and cannot be added to cache", order_id);
-                    return Ok(());
+                    // // If ASAP processing failed, we need to add the original order to cache
+                    // // But order was moved, so we need to handle this differently
+                    // // For now, let's just skip adding to cache if ASAP failed
+                    // tracing::warn!("ASAP order {} failed processing and cannot be added to cache", order_id);
+                    // return Ok(());
                 }
                 
                 // Add to cache for later processing (non-ASAP orders)

@@ -405,12 +405,12 @@ impl<P: Provider> BoundlessMarketService<P> {
         client_sig: impl Into<Bytes>,
         priority_gas: Option<u64>,
     ) -> Result<u64, MarketError> {
-        tracing::trace!("Calling requestIsLocked({:x})", request.id);
-        let is_locked_in: bool =
-            self.instance.requestIsLocked(request.id).call().await.context("call failed")?;
-        if is_locked_in {
-            return Err(MarketError::RequestAlreadyLocked(request.id));
-        }
+        // tracing::trace!("Calling requestIsLocked({:x})", request.id);
+        // let is_locked_in: bool =
+        //     self.instance.requestIsLocked(request.id).call().await.context("call failed")?;
+        // if is_locked_in {
+        //     return Err(MarketError::RequestAlreadyLocked(request.id));
+        // }
 
         let client_sig_bytes = client_sig.into();
         tracing::trace!("Calling lockRequest({:x?}, {:x?})", request, client_sig_bytes);
