@@ -236,6 +236,12 @@ pub struct MarketConf {
     /// Used to limit pricing tasks spawned to prevent overwhelming the system
     #[serde(default = "defaults::max_concurrent_preflights")]
     pub max_concurrent_preflights: u32,
+    /// Skip preflight execution entirely
+    ///
+    /// When enabled, orders will be priced and processed without running preflight to determine cycle counts.
+    /// This can significantly speed up order processing but removes the ability to validate predicates and estimate costs accurately.
+    #[serde(default)]
+    pub skip_preflight: bool,
     /// Order pricing priority mode
     ///
     /// Determines how orders are prioritized for pricing. Options:
@@ -284,6 +290,7 @@ impl Default for MarketConf {
             max_concurrent_proofs: None,
             cache_dir: None,
             max_concurrent_preflights: defaults::max_concurrent_preflights(),
+            skip_preflight: false,
             order_pricing_priority: OrderPricingPriority::default(),
             order_commitment_priority: OrderCommitmentPriority::default(),
         }

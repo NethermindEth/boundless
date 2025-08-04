@@ -465,6 +465,25 @@ where
             return Ok(Skip);
         }
 
+        // Check if preflight should be skipped entirely
+        let skip_preflight = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            config.market.skip_preflight
+        };
+
+        if skip_preflight {
+            tracing::info!("Skipping preflight for order {order_id} due to skip_preflight configuration.  Locking order ASAP.");
+
+            // Lock immediately with estimated cycles
+            let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
+
+            return Ok(Lock { 
+                total_cycles: 1,
+                target_timestamp_secs: 0,
+                expiry_secs: expiry_secs
+            });
+        }
+
         tracing::debug!(
             "Starting preflight execution of {order_id} with limit of {} cycles (~{} mcycles)",
             exec_limit_cycles,
