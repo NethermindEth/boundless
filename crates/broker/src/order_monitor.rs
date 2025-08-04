@@ -635,6 +635,27 @@ where
 
         let mut final_orders: Vec<Arc<OrderRequest>> = Vec::with_capacity(capacity_granted);
 
+        // Ignore gas price
+        let skip_preflight = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            config.market.skip_preflight
+        };
+
+        if skip_preflight {
+            tracing::info!("Skipping preflight.  Ignoring gas price and available balance.");
+
+            // Add all orders to final_orders, until the capacity_granted is reached
+            for order in orders {
+                if final_orders.len() >= capacity_granted {
+                    tracing::info!("Reached capacity granted.  Skipping remaining orders.");
+                    break;
+                }
+                final_orders.push(order);
+            }
+
+            return Ok(final_orders);
+        }
+
         // Get current gas price and available balance
         let gas_price =
             self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
@@ -878,10 +899,9 @@ where
         let mut first_block = 0;
         
         // Use a shorter fixed interval for faster processing, but still respect block boundaries
-        let processing_interval = std::cmp::min(self.block_time, 1); // Cap at 1 second for ASAP orders
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(processing_interval),
+            tokio::time::Duration::from_millis(100),
         );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -906,7 +926,7 @@ where
                         if first_block == 0 {
                             first_block = block_number;
                         }
-                        tracing::trace!(
+                        tracing::debug!(
                             "Order monitor processing block {block_number} at timestamp {block_timestamp}"
                         );
 
@@ -916,7 +936,7 @@ where
                         let mut valid_orders = self.get_valid_orders(block_timestamp, monitor_config.min_deadline).await?;
 
                         if valid_orders.is_empty() {
-                            tracing::trace!(
+                            tracing::debug!(
                                 "No orders to lock and/or prove as of block timestamp {}",
                                 block_timestamp
                             );
@@ -924,9 +944,11 @@ where
                         }
 
                         // Prioritize the orders that intend to fulfill based on configured commitment priority.
+                        tracing::debug!("Prioritizing orders based on commitment priority.");
                         valid_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
 
                         // Filter down the orders given our max concurrent proofs, peak khz limits, and gas limitations.
+                        tracing::debug!("Applying capacity limits.");
                         let final_orders = self
                             .apply_capacity_limits(
                                 valid_orders,
@@ -935,7 +957,7 @@ where
                             )
                             .await?;
 
-                        tracing::trace!("After processing block {}[timestamp {}], we will now start locking and/or proving {} orders.",
+                        tracing::debug!("After processing block {}[timestamp {}], we will now start locking and/or proving {} orders.",
                             block_number,
                             block_timestamp,
                             final_orders.len(),
@@ -943,6 +965,7 @@ where
 
                         if !final_orders.is_empty() {
                             // Lock and prove filtered orders.
+                            tracing::debug!("Locking and proving {} orders.", final_orders.len());
                             self.lock_and_prove_orders(&final_orders).await?;
                         }
                     }
