@@ -1,0 +1,74 @@
+x-base-environment: &base-environment
+  DATABASE_URL: postgresql://${POSTGRES_USER:-worker}:${POSTGRES_PASSWORD:-password}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-taskdb}
+  REDIS_URL: redis://${REDIS_HOST:-redis}:6379
+  S3_URL: http://${MINIO_HOST:-minio}:9000
+  S3_BUCKET: ${MINIO_BUCKET:-workflow}
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASS:-password}
+  RUST_LOG: ${RUST_LOG:-info}
+  RUST_BACKTRACE: 1
+
+x-agent-common: &agent-common
+  image: risczero/risc0-bento-agent:2.3.1@sha256:7873f18005efff03fc5399f1bdcb6760cda7ffbd4fdd4d9c39aedee8972e0a0d
+  restart: always
+  runtime: nvidia
+  mem_limit: 4G
+  cpus: 4
+  depends_on:
+    - postgres
+    - redis
+    - minio
+  environment:
+    <<: *base-environment
+
+x-exec-agent-common: &exec-agent-common
+  <<: *agent-common
+  mem_limit: 4G
+  cpus: 3
+  environment:
+    <<: *base-environment
+    LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-/usr/local/cuda-12.2/compat/}
+    RISC0_KECCAK_PO2: ${RISC0_KECCAK_PO2:-17}
+  entrypoint: /app/agent -t exec --segment-po2 ${SEGMENT_SIZE:-22} --redis-ttl ${REDIS_TTL:-57600}
+
+services:
+  exec_agent_0:
+    <<: *exec-agent-common
+  exec_agent_1:
+    <<: *exec-agent-common
+  exec_agent_2:
+    <<: *exec-agent-common
+  exec_agent_3:
+    <<: *exec-agent-common
+  exec_agent_4:
+    <<: *exec-agent-common
+  exec_agent_5:
+    <<: *exec-agent-common
+  exec_agent_6:
+    <<: *exec-agent-common
+  exec_agent_7:
+    <<: *exec-agent-common
+  exec_agent_8:
+    <<: *exec-agent-common
+  exec_agent_9:
+    <<: *exec-agent-common
+  exec_agent_10:
+    <<: *exec-agent-common
+  exec_agent_11:
+    <<: *exec-agent-common
+  exec_agent_12:
+    <<: *exec-agent-common
+  exec_agent_13:
+    <<: *exec-agent-common
+  gpu_prove_agent_0:
+    <<: *agent-common
+    # mem_limit: 4G
+    # cpus: 4
+    entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
