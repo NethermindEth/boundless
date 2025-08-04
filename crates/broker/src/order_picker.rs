@@ -300,6 +300,25 @@ where
         let order_id = order.id();
         tracing::debug!("Pricing order {order_id}");
 
+        // Check if preflight should be skipped entirely
+        let skip_preflight = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            config.market.skip_preflight
+        };
+
+        if skip_preflight {
+            tracing::info!("Skipping preflight for order {order_id} due to skip_preflight configuration.  Locking order ASAP.");
+
+            // Lock immediately with estimated cycles
+            let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
+
+            return Ok(Lock { 
+                total_cycles: 1,
+                target_timestamp_secs: 0,
+                expiry_secs: expiry_secs
+            });
+        }
+
         let now = now_timestamp();
 
         // If order_expiration > lock_expiration the period in-between is when order can be filled
@@ -463,25 +482,6 @@ where
             tracing::info!("Removing order {order_id} because its exec limit is too low");
 
             return Ok(Skip);
-        }
-
-        // Check if preflight should be skipped entirely
-        let skip_preflight = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            config.market.skip_preflight
-        };
-
-        if skip_preflight {
-            tracing::info!("Skipping preflight for order {order_id} due to skip_preflight configuration.  Locking order ASAP.");
-
-            // Lock immediately with estimated cycles
-            let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
-
-            return Ok(Lock { 
-                total_cycles: 1,
-                target_timestamp_secs: 0,
-                expiry_secs: expiry_secs
-            });
         }
 
         tracing::debug!(

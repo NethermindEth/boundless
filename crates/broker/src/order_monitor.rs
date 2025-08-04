@@ -224,27 +224,27 @@ where
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
 
-        let order_status = self
-            .market
-            .get_status(request_id, Some(order.request.expires_at()))
-            .await
-            .context("Failed to get request status")?;
-        if order_status != RequestStatus::Unknown {
-            tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
-            // TODO: fetch some chain data to find out who / and for how much the order
-            // was locked in at
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
+        // let order_status = self
+        //     .market
+        //     .get_status(request_id, Some(order.request.expires_at()))
+        //     .await
+        //     .context("Failed to get request status")?;
+        // if order_status != RequestStatus::Unknown {
+        //     tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
+        //     // TODO: fetch some chain data to find out who / and for how much the order
+        //     // was locked in at
+        //     return Err(OrderMonitorErr::AlreadyLocked);
+        // }
 
-        let is_locked = self
-            .db
-            .is_request_locked(U256::from(order.request.id))
-            .await
-            .context("Failed to check if request is locked")?;
-        if is_locked {
-            tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
+        // let is_locked = self
+        //     .db
+        //     .is_request_locked(U256::from(order.request.id))
+        //     .await
+        //     .context("Failed to check if request is locked")?;
+        // if is_locked {
+        //     tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
+        //     return Err(OrderMonitorErr::AlreadyLocked);
+        // }
 
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
@@ -858,39 +858,6 @@ where
         })
     }
 
-    // Fast path for ASAP orders that skips expensive database lookups
-    async fn validate_asap_order(&self, order: &OrderRequest) -> Result<bool, OrderMonitorErr> {
-        // For ASAP orders, we can skip most validation since they're meant to be processed immediately
-        // Just do basic checks that don't require database access
-        
-        let current_block_timestamp = self.chain_monitor.current_chain_head().await?.block_timestamp;
-        
-        // Check if order has expired
-        let expiration = order.expiry();
-        if expiration < current_block_timestamp {
-            tracing::debug!("ASAP order {} has expired, skipping", order.id());
-            return Ok(false);
-        }
-        
-        // Check if target timestamp is reached (should be 0 for ASAP orders)
-        match order.target_timestamp {
-            Some(target_timestamp) => {
-                if current_block_timestamp < target_timestamp {
-                    tracing::debug!("ASAP order {} target timestamp not yet reached", order.id());
-                    return Ok(false);
-                }
-            }
-            None => {
-                tracing::warn!("ASAP order {} has no target timestamp set", order.id());
-                return Ok(false);
-            }
-        }
-        
-        // For ASAP orders, we assume they're not locked by others since they just arrived
-        // and we're processing them immediately
-        Ok(true)
-    }
-
     pub async fn start_monitor(
         self,
         cancel_token: CancellationToken,
@@ -993,29 +960,27 @@ where
                     tracing::info!("Processing ASAP order {}", order_id);
                     
                     // Use fast validation path for ASAP orders
-                    if self.validate_asap_order(&order).await? {
-                        let monitor_config = self.get_monitor_config().await?;
-                        
-                        // Create a single-item vector for the order
-                        let order_arc = Arc::from(order);
-                        let valid_orders = vec![order_arc];
-                        
-                        // Prioritize and apply capacity limits
-                        let prioritized_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
-                        let mut prev_orders_by_status = String::new();
-                        let final_orders = self.apply_capacity_limits(prioritized_orders, &monitor_config, &mut prev_orders_by_status).await?;
-                        
-                        if !final_orders.is_empty() {
-                            tracing::debug!("Immediately processing ASAP order {}", order_id);
-                            self.lock_and_prove_orders(&final_orders).await?;
-                            return Ok(());
-                        }
-                        
-                        // If capacity limits prevented processing, add the Arc to cache
-                        if let Some(order_arc) = final_orders.into_iter().next() {
-                            self.lock_and_prove_cache.insert(order_id, order_arc).await;
-                            return Ok(());
-                        }
+                    let monitor_config = self.get_monitor_config().await?;
+
+                    // Create a single-item vector for the order
+                    let order_arc = Arc::from(order);
+                    let valid_orders = vec![order_arc];
+
+                    // // Prioritize and apply capacity limits
+                    // let prioritized_orders = self.prioritize_orders(valid_orders, monitor_config.order_commitment_priority, monitor_config.priority_addresses.as_deref());
+                    let mut prev_orders_by_status = String::new();
+                    let final_orders = self.apply_capacity_limits(valid_orders, &monitor_config, &mut prev_orders_by_status).await?;
+                    
+                    if !final_orders.is_empty() {
+                        tracing::debug!("Immediately processing ASAP order {}", order_id);
+                        self.lock_and_prove_orders(&final_orders).await?;
+                        return Ok(());
+                    }
+                    
+                    // If capacity limits prevented processing, add the Arc to cache
+                    if let Some(order_arc) = final_orders.into_iter().next() {
+                        self.lock_and_prove_cache.insert(order_id, order_arc).await;
+                        return Ok(());
                     }
                     
                     // If ASAP processing failed, we need to add the original order to cache
