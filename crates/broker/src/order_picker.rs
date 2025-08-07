@@ -306,6 +306,34 @@ where
             config.market.skip_preflight
         };
 
+        let (min_deadline, allowed_addresses_opt, denied_addresses_opt) = {
+            let config = self.config.lock_all().context("Failed to read config")?;
+            (
+                config.market.min_deadline,
+                config.market.allow_client_addresses.clone(),
+                config.market.deny_requestor_addresses.clone(),
+            )
+        };
+
+        // Initial sanity checks:
+        if let Some(allow_addresses) = allowed_addresses_opt {
+            let client_addr = order.request.client_address();
+            if !allow_addresses.contains(&client_addr) {
+                tracing::info!("Removing order {order_id} from {client_addr} because it is not in allowed addrs");
+                return Ok(Skip);
+            }
+        }
+
+        if let Some(deny_addresses) = denied_addresses_opt {
+            let client_addr = order.request.client_address();
+            if deny_addresses.contains(&client_addr) {
+                tracing::info!(
+                    "Removing order {order_id} from {client_addr} because it is in denied addrs"
+                );
+                return Ok(Skip);
+            }
+        }
+
         if skip_preflight {
             tracing::info!("Skipping preflight for order {order_id} due to skip_preflight configuration.  Locking order ASAP.");
 
@@ -334,39 +362,11 @@ where
             return Ok(Skip);
         };
 
-        let (min_deadline, allowed_addresses_opt, denied_addresses_opt) = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            (
-                config.market.min_deadline,
-                config.market.allow_client_addresses.clone(),
-                config.market.deny_requestor_addresses.clone(),
-            )
-        };
-
         // Does the order expire within the min deadline
         let seconds_left = expiration.saturating_sub(now);
         if seconds_left <= min_deadline {
             tracing::info!("Removing order {order_id} because it expires within min_deadline: {seconds_left}, min_deadline: {min_deadline}");
             return Ok(Skip);
-        }
-
-        // Initial sanity checks:
-        if let Some(allow_addresses) = allowed_addresses_opt {
-            let client_addr = order.request.client_address();
-            if !allow_addresses.contains(&client_addr) {
-                tracing::info!("Removing order {order_id} from {client_addr} because it is not in allowed addrs");
-                return Ok(Skip);
-            }
-        }
-
-        if let Some(deny_addresses) = denied_addresses_opt {
-            let client_addr = order.request.client_address();
-            if deny_addresses.contains(&client_addr) {
-                tracing::info!(
-                    "Removing order {order_id} from {client_addr} because it is in denied addrs"
-                );
-                return Ok(Skip);
-            }
         }
 
         if !self.supported_selectors.is_supported(order.request.requirements.selector) {
