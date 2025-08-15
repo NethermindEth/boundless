@@ -94,12 +94,21 @@ pub(crate) async fn create_uri_handler(
             Ok(Arc::new(handler))
         }
         "http" | "https" => {
+            let uri_to_use = if uri.host() == Some(url::Host::Domain("gateway.pinata.cloud")) {
+                let mut new_uri = uri.clone();
+                new_uri.set_scheme("http").unwrap();
+                new_uri.set_host(Some("localhost")).unwrap();
+                new_uri.set_port(Some(8090)).unwrap();
+                new_uri
+            } else {
+                uri
+            };
             let (max_size, max_retries, cache_dir) = {
-                let config = &config.lock_all().expect("lock failed").market;
+                let config = &config.lock_all().expect("lock_failed").market;
                 let size = if skip_max_size_check { usize::MAX } else { config.max_file_size };
                 (size, config.max_fetch_retries, config.cache_dir.clone())
             };
-            let handler = HttpHandler::new(uri, max_size, cache_dir, max_retries).await?;
+            let handler = HttpHandler::new(uri_to_use, max_size, cache_dir, max_retries).await?;
 
             Ok(Arc::new(handler))
         }
