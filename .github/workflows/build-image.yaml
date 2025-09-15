@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  build_simple:
+  build_agent:
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
     with:
       group_name: "angkor"
@@ -22,8 +22,27 @@ jobs:
       platforms: "linux/amd64"
       run_trivy: false
       docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.0/bento-bundle-linux-amd64.tar.gz"
-      pre_build_script: |
-        # Clean up some space
-        sudo rm -rf /usr/share/dotnet || true
-        sudo rm -rf /usr/local/share/powershell || true
-        sudo rm -rf /usr/lib/jvm || true
+
+  build_broker:
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
+    with:
+      group_name: "angkor"
+      runner: ubuntu-gigachad
+      image_name: "boundless-broker"
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "dockerfiles/broker.prebuilt.dockerfile"
+      platforms: "linux/amd64"
+      run_trivy: false
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/broker-v1.0.0/broker"
+
+  build_rest_api:
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
+    with:
+      group_name: "angkor"
+      runner: ubuntu-gigachad
+      image_name: "boundless-rest-api"
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "dockerfiles/broker.prebuilt.dockerfile"
+      platforms: "linux/amd64"
+      run_trivy: false
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.0/bento-bundle-linux-amd64.tar.gz"
