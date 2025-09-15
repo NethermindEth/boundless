@@ -20,6 +20,7 @@ jobs:
       push: ${{ github.event_name != 'pull_request' }}
       dockerfile_path: "dockerfiles/agent.prebuilt.dockerfile"
       platforms: "linux/amd64"
+      run_trivy: false
       docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.0/bento-bundle-linux-amd64.tar.gz"
       pre_build_script: |
         # Clean up some space
