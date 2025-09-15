@@ -18,3 +18,4 @@ jobs:
       image_name: "boundless-agent"
       push: ${{ github.event_name != 'pull_request' }}
       dockerfile_path: "dockerfiles/agent.prebuilt.dockerfile"
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.0/bento-bundle-linux-amd64.tar.gz"
