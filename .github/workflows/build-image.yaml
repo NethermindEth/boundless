@@ -21,7 +21,7 @@ jobs:
       dockerfile_path: "dockerfiles/agent.prebuilt.dockerfile"
       platforms: "linux/amd64"
       run_trivy: false
-      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.0/bento-bundle-linux-amd64.tar.gz"
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.1/bento-bundle-linux-amd64.tar.gz"
 
   build_broker:
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
@@ -45,4 +45,15 @@ jobs:
       dockerfile_path: "dockerfiles/rest_api.prebuilt.dockerfile"
       platforms: "linux/amd64"
       run_trivy: false
-      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.0/bento-bundle-linux-amd64.tar.gz"
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.0.1/bento-bundle-linux-amd64.tar.gz"
+
+  build_sidecar:
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
+    with:
+      group_name: "angkor"
+      runner: ubuntu-arm64-2-core
+      image_name: "boundless-sidecar"
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "sidecar.Dockerfile"
+      platforms: "linux/amd64"
+      run_trivy: false
