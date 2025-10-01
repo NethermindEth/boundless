@@ -1,7 +1,7 @@
 FROM ubuntu
 
 # Base dependencies
-RUN RUN apt-get update && \
+RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get -y install tzdata && \
     apt-get install -y python3 postgresql-client sqlite3 && \
     rm -rf /var/lib/apt/lists/*
