@@ -69,7 +69,7 @@ class DatabaseOrderRetry:
         """
         query = " ".join([q.strip() for q in query.split("\n") if q.strip()])
         rows = subprocess.check_output(
-            f'sqlite3 /db/broker.db "{query}"',
+            f'sqlite3 {os.environ.get("DB_PATH", '/db/broker.db')} "{query}"',
             shell=True,
             timeout=120,  # 2 minutes
         )

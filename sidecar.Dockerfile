@@ -6,9 +6,9 @@ RUN apt-get update && \
     apt-get install -y python3 postgresql-client sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
+USER ubuntu
 WORKDIR /app
 
-COPY reset.sh /app/reset.sh
-COPY db_order_retry.py /app/db_order_retry.py
+COPY reset.sh skip.sh status.sh db_order_retry.py /app/
 
 ENTRYPOINT ["python3", "/app/db_order_retry.py"]

@@ -36,6 +36,7 @@ PG_HOST="${POSTGRES_HOST:-localhost}"
 PG_PORT="${POSTGRES_PORT:-5432}"
 PG_USER="${POSTGRES_USER:-worker}"
 PG_DB="${POSTGRES_DB:-taskdb}"
+export PGPASSWORD="${POSTGRES_PASS:-password}"
 PG_SQL="DELETE FROM public.task_deps WHERE job_id = '${JOB_ID}'; DELETE FROM public.tasks WHERE job_id = '${JOB_ID}'; DELETE FROM public.jobs WHERE id = '${JOB_ID}';"
 
 PG_RESULT=$(psql -h "${PG_HOST}" -p "${PG_PORT}" -U "${PG_USER}" -d "${PG_DB}" -c "${PG_SQL}")
