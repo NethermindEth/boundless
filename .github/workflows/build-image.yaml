@@ -71,3 +71,17 @@ jobs:
     secrets:
       dockerhub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
       dockerhub_password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+  build_base:
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-dockerhub.yaml@main
+    with:
+      runner: ubuntu-gigachad
+      image_name: boundless-base
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "base.Dockerfile"
+      platforms: "linux/amd64,linux/arm64"
+      run_trivy: false
+      additional_tags: "v1.0.2"
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
+      dockerhub_password: ${{ secrets.DOCKER_HUB_PASSWORD }}
