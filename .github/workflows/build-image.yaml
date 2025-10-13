@@ -102,7 +102,7 @@ jobs:
 
   build_cli:
     needs: [changes, build_base]
-    if: ${{ !cancelled() && (needs.changes.outputs.cli == 'true' || github.ref_type == 'tag') }}
+    if: ${{ always() && !cancelled() && (needs.changes.outputs.cli == 'true' || github.ref_type == 'tag') && (needs.build_base.result == 'success' || needs.build_base.result == 'skipped') }}
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-dockerhub.yaml@main
     with:
       runner: ubuntu-gigachad
