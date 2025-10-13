@@ -63,7 +63,8 @@ class DatabaseOrderRetry:
                     json_extract(data, '$.updated_at') as updated_at,
                     json_extract(data, '$.error_msg') as error_msg,
                     json_extract(data, '$.request.id') as request_id,
-                    json_extract(data, '$.fulfillment_type') as fulfillment_type
+                    json_extract(data, '$.fulfillment_type') as fulfillment_type,
+                    json_extract(data, '$.expire_timestamp') as expire_timestamp
             FROM orders 
             WHERE json_extract(data, '$.status') = 'Failed';
         """
@@ -86,6 +87,7 @@ class DatabaseOrderRetry:
                 "error_msg": data[2],
                 "request_id": data[3],
                 "fulfillment_type": data[4],
+                "expire_timestamp": data[5],
             }
             failed_orders.append(order_data)
 
@@ -109,6 +111,14 @@ class DatabaseOrderRetry:
 
         return datetime.now() < grace_period_end
 
+    def is_expired_order(self, timestamp: int|None) -> bool:
+        """
+        Check if an order is expired based on the timestamp.
+        """
+        if timestamp is None:
+            return False
+        return timestamp > time.time()
+
     def should_retry_order(self, order_data: Dict) -> bool:
         """
         Determine if an order should be retried based on various criteria.
@@ -126,7 +136,13 @@ class DatabaseOrderRetry:
             self.logger.info(f"Order {order_id} is within grace period, skipping")
             return False
 
-        # Skip FulfillAfterLockExpire orders (as per original script logic)
+        # Skip expired orders
+        if self.is_expired_order(order_data["expire_timestamp"]):
+            self.logger.info(f"Order {order_id} is expired, skipping")
+            return False
+
+        # Skip FulfillAfterLockExpire orders.  It's unlikely that we will still
+        # be able to compete for the order.
         fulfillment_type = order_data.get("fulfillment_type", "")
         if "FulfillAfterLockExpire" in str(fulfillment_type):
             self.logger.info(f"Skipping FulfillAfterLockExpire order: {order_id}")
