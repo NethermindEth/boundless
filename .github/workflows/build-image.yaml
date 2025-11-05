@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags: ["v*"]
 
+  workflow_dispatch:
+
 permissions:
   id-token: write
   attestations: write
@@ -44,7 +46,7 @@ jobs:
 
   build_agent:
     needs: changes
-    if: ${{ needs.changes.outputs.agent == 'true' || github.ref_type == 'tag' }}
+    if: ${{ needs.changes.outputs.agent == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch' }}
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
     with:
       group_name: "angkor"
@@ -58,7 +60,7 @@ jobs:
 
   build_broker:
     needs: changes
-    if: ${{ needs.changes.outputs.broker == 'true' || github.ref_type == 'tag' }}
+    if: ${{ needs.changes.outputs.broker == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch' }}
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
     with:
       group_name: "angkor"
@@ -72,7 +74,7 @@ jobs:
 
   build_rest_api:
     needs: changes
-    if: ${{ needs.changes.outputs.rest_api == 'true' || github.ref_type == 'tag' }}
+    if: ${{ needs.changes.outputs.rest_api == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch' }}
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
     with:
       group_name: "angkor"
@@ -86,7 +88,7 @@ jobs:
 
   build_base:
     needs: changes
-    if: ${{ needs.changes.outputs.base == 'true' || github.ref_type == 'tag' }}
+    if: ${{ needs.changes.outputs.base == 'true' }}
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-dockerhub.yaml@main
     with:
       runner: ubuntu-gigachad
@@ -102,7 +104,7 @@ jobs:
 
   build_cli:
     needs: [changes, build_base]
-    if: ${{ always() && !cancelled() && (needs.changes.outputs.cli == 'true' || github.ref_type == 'tag') && (needs.build_base.result == 'success' || needs.build_base.result == 'skipped') }}
+    if: ${{ always() && !cancelled() && (needs.changes.outputs.cli == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch') && (needs.build_base.result == 'success' || needs.build_base.result == 'skipped') }}
     uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-dockerhub.yaml@main
     with:
       runner: ubuntu-gigachad
