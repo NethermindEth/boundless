@@ -15,7 +15,8 @@ config:
   order-generator-base:COLLATERAL_TOKEN_ADDRESS: 0x8d4dA4b7938471A919B08F941461b2ed1679d7bb
   order-generator-base:LOCK_TIMEOUT: "900"
   order-generator-base:LOG_LEVEL: info
-  order-generator-base:MAX_PRICE_PER_MCYCLE: "0.00002"
+  order-generator-offchain:MAX_PRICE_PER_MCYCLE: "0.00002"
+  order-generator-onchain:MAX_PRICE_PER_MCYCLE: "0.000025"
   order-generator-base:MIN_PRICE_PER_MCYCLE: "0"
   order-generator-base:ORDER_STREAM_URL: https://base-sepolia.boundless.network
   order-generator-base:PAGERDUTY_ALERTS_TOPIC_ARN: arn:aws:sns:us-west-2:968153779208:boundless-pagerduty-topic
@@ -33,7 +34,7 @@ config:
   order-generator-offchain:RAMP_UP: "300"
   order-generator-offchain:INTERVAL: "1200"
   order-generator-base:ETH_RPC_URL:
-    secure: v1:LHeRf1HVcscfrxMK:Veo5eMjFNMwc8K0ckxv4epytnDrN4AXt7lhBeCjLmpVh6WbJ0G+QakJiGUJbU4taixqcK+fP7NjXGAob+f/PNB2VvjMLum56N17Y
+    secure: v1:uZEuyLiZRrMdjJKj:ADWgToRtGwtyH4DTO1ztJzge/b9NLGN920eoZ4pjKiaoX+Dfu+qm1CFQ/1jsD6QCXdUSw58HzvNB7XA12QLOgspC2qqji64u5+3CVg1g67DivsKYuXqhopZfHMTK+zgcohPDHkiDLLXrFqBDbXl0npKR6ew=
   order-generator-onchain:PRIVATE_KEY:
     secure: v1:OyulKh+LRE/0Jv0o:Mw0ZnN8GxEOv4DeqgVP6kNjh9vimxeLgweKEB7KpJBSve6Me8g4LQ2VH3DaNGSzBNs6ZJ27rI3E7dJFvQvX6o4GvEu6Zf2RkNBO3JmPLKII=
   order-generator-onchain:INPUT_MAX_MCYCLES: "10"

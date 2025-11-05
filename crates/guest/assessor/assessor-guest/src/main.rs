@@ -1,4 +1,4 @@
-// Copyright 2025 RISC Zero, Inc.
+// Copyright 2025 Boundless Foundation, Inc.
 //
 // Use of this source code is governed by the Business Source License
 // as found in the LICENSE-BSL file.
@@ -51,6 +51,7 @@ fn main() {
         // by this guest. This check is not strictly needed, but reduces the chance of accidentally
         // failing to enforce a constraint.
         RequestId::try_from(fill.request.id).unwrap();
+        fill.request.validate().expect("request is not valid");
 
         // ECDSA signatures are always checked here.
         // Smart contract signatures (via EIP-1271) are checked on-chain either when a request is locked,

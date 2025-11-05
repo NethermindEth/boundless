@@ -1,8 +1,8 @@
-// Copyright 2025 RISC Zero, Inc.
+// Copyright 2025 Boundless Foundation, Inc.
 //
 // Use of this source code is governed by the Business Source License
 // as found in the LICENSE-BSL file.
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.26;
 
 import {BaseClient} from "./BaseClient.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";

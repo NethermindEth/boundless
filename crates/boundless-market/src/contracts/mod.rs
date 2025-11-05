@@ -1,4 +1,4 @@
-// Copyright 2025 RISC Zero, Inc.
+// Copyright 2025 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -281,6 +281,10 @@ pub enum RequestError {
     #[error("signature error: {0}")]
     SignatureError(#[from] alloy::signers::Error),
 
+    /// Signature is non-canonical.
+    #[error("invalid signature: not normalized s-value")]
+    SignatureNonCanonicalError,
+
     /// The image URL is empty.
     #[error("image URL must not be empty")]
     EmptyImageUrl,
@@ -492,8 +496,7 @@ impl ProofRequest {
         contract_addr: Address,
         chain_id: u64,
     ) -> Result<Signature, RequestError> {
-        let domain = eip712_domain(contract_addr, chain_id);
-        let hash = self.eip712_signing_hash(&domain.alloy_struct());
+        let hash = self.signing_hash(contract_addr, chain_id)?;
         Ok(signer.sign_hash(&hash).await?)
     }
 
@@ -517,8 +520,11 @@ impl ProofRequest {
         chain_id: u64,
     ) -> Result<(), RequestError> {
         let sig = Signature::try_from(signature.as_ref())?;
-        let domain = eip712_domain(contract_addr, chain_id);
-        let hash = self.eip712_signing_hash(&domain.alloy_struct());
+        // Check if the signature is non-canonical.
+        if sig.normalize_s().is_some() {
+            return Err(RequestError::SignatureNonCanonicalError);
+        }
+        let hash = self.signing_hash(contract_addr, chain_id)?;
         let addr = sig.recover_address_from_prehash(&hash)?;
         if addr == self.client_address() {
             Ok(())

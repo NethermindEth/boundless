@@ -1,8 +1,8 @@
-// Copyright 2025 RISC Zero, Inc.
+// Copyright 2025 Boundless Foundation, Inc.
 //
 // Use of this source code is governed by the Business Source License
 // as found in the LICENSE-BSL file.
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.26;
 
 uint256 constant REQUEST_FLAGS_BITWIDTH = 2;
 uint256 constant REQUEST_FLAGS_INITIAL_BITS = 64;

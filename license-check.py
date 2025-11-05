@@ -6,14 +6,14 @@ from pathlib import Path
 import subprocess
 
 BSL_HEADER = """
-// Copyright {YEAR} RISC Zero, Inc.
+// Copyright {YEAR} Boundless Foundation, Inc.
 //
 // Use of this source code is governed by the Business Source License
 // as found in the LICENSE-BSL file.
 """.strip().splitlines()
 
 APACHE_HEADER = """
-// Copyright {YEAR} RISC Zero, Inc.
+// Copyright {YEAR} Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -65,6 +65,7 @@ APACHE_PATHS = [
     str(Path.cwd()) + "/crates/ops-lambdas",
     str(Path.cwd()) + "/crates/order-generator",
     str(Path.cwd()) + "/crates/order-stream",
+    str(Path.cwd()) + "/crates/requestor-lists",
     str(Path.cwd()) + "/crates/slasher",
     str(Path.cwd()) + "/crates/test-utils",
     str(Path.cwd()) + "/documentation",
