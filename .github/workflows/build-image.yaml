@@ -56,7 +56,7 @@ jobs:
       dockerfile_path: "dockerfiles/agent.prebuilt.dockerfile"
       platforms: "linux/amd64"
       run_trivy: false
-      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.1.0/bento-bundle-linux-amd64.tar.gz"
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.1.1/bento-bundle-linux-amd64.tar.gz"
 
   build_broker:
     needs: changes
@@ -70,7 +70,7 @@ jobs:
       dockerfile_path: "dockerfiles/broker.prebuilt.dockerfile"
       platforms: "linux/amd64"
       run_trivy: false
-      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/broker-v1.1.0/broker"
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/broker-v1.1.1/broker"
 
   build_rest_api:
     needs: changes
@@ -84,7 +84,7 @@ jobs:
       dockerfile_path: "dockerfiles/rest_api.prebuilt.dockerfile"
       platforms: "linux/amd64"
       run_trivy: false
-      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.1.0/bento-bundle-linux-amd64.tar.gz"
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-v1.1.1/bento-bundle-linux-amd64.tar.gz"
 
   build_base:
     needs: changes
@@ -97,7 +97,7 @@ jobs:
       dockerfile_path: "base.Dockerfile"
       platforms: "linux/amd64,linux/arm64"
       run_trivy: false
-      additional_tags: "v1.1.0"
+      additional_tags: "v1.1.1"
     secrets:
       dockerhub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
       dockerhub_password: ${{ secrets.DOCKER_HUB_PASSWORD }}
@@ -113,7 +113,7 @@ jobs:
       dockerfile_path: "boundless_cli.Dockerfile"
       platforms: "linux/amd64,linux/arm64"
       run_trivy: false
-      additional_tags: "v1.1.0"
+      additional_tags: "v1.1.1"
     secrets:
       dockerhub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
       dockerhub_password: ${{ secrets.DOCKER_HUB_PASSWORD }}
