@@ -1,6 +1,6 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
-import {BasePipelineArgs} from "./base";
+import { BasePipelineArgs } from "./base";
 
 interface PackerPipelineArgs extends BasePipelineArgs {
     opsAccountId: string;
@@ -48,7 +48,7 @@ export class PackerPipeline extends pulumi.ComponentResource {
     constructor(name: string, args: PackerPipelineArgs, opts?: pulumi.ComponentResourceOptions) {
         super("pulumi:aws:packer-pipeline", name, args, opts);
 
-        const {artifactBucket, connection, serviceAccountIds, role, slackAlertsTopicArn} = args;
+        const { artifactBucket, connection, serviceAccountIds, role, slackAlertsTopicArn } = args;
 
         // CodeBuild project for Packer builds
         const packerBuildProject = new aws.codebuild.Project("packer-build-project", {
@@ -69,11 +69,11 @@ export class PackerPipeline extends pulumi.ComponentResource {
                     },
                     {
                         name: "BOUNDLESS_BENTO_VERSION",
-                        value: "v1.0.1",
+                        value: "v1.1.2",
                     },
                     {
                         name: "BOUNDLESS_BROKER_VERSION",
-                        value: "v1.0.0",
+                        value: "v1.1.2",
                     },
                     {
                         name: "DEVELOPMENT_ACCOUNT_ID",
@@ -99,11 +99,10 @@ export class PackerPipeline extends pulumi.ComponentResource {
             },
             sourceVersion: "CODEPIPELINE",
             tags: {
-                Project: "boundless",
+                Name: `${APP_NAME}-packer-build`,
                 Component: "packer",
-                Environment: "ops",
             },
-        }, {parent: this});
+        }, { parent: this });
 
 
         // Create the main pipeline
@@ -149,11 +148,10 @@ export class PackerPipeline extends pulumi.ComponentResource {
                 }
             ],
             tags: {
-                Project: "boundless",
+                Name: `${APP_NAME}-pipeline`,
                 Component: "packer",
-                Environment: "ops",
             },
-        }, {parent: this});
+        }, { parent: this });
 
         // Create notification rule
         new aws.codestarnotifications.NotificationRule(`${APP_NAME}-pipeline-notifications`, {
@@ -168,6 +166,10 @@ export class PackerPipeline extends pulumi.ComponentResource {
                     address: slackAlertsTopicArn.apply(arn => arn),
                 },
             ],
+            tags: {
+                Name: `${APP_NAME}-pipeline-notifications`,
+                Component: "packer",
+            },
         });
 
         // Outputs
