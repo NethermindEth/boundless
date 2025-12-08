@@ -1,6 +1,8 @@
 FROM nethermindeth/boundless-base
 
-RUN /root/.cargo/bin/cargo install --locked --git https://github.com/boundless-xyz/boundless boundless-cli --branch release-1.1 --bin boundless && \
+ARG BUILD_DATE
+RUN echo "Building on $BUILD_DATE" && \
+    /root/.cargo/bin/cargo install --locked --git https://github.com/boundless-xyz/boundless boundless-cli --branch release-1.1 --bin boundless && \
     /root/.cargo/bin/boundless completions bash > /etc/bash_completion.d/boundless && \
     echo "source /etc/bash_completion.d/boundless" >> /root/.bashrc
 

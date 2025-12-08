@@ -111,6 +111,7 @@ jobs:
       image_name: boundless-cli
       push: ${{ github.event_name != 'pull_request' }}
       dockerfile_path: "boundless_cli.Dockerfile"
+      docker_build_args: "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
       platforms: "linux/amd64,linux/arm64"
       run_trivy: false
       additional_tags: "v1.1.2"
