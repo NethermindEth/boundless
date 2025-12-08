@@ -36,6 +36,7 @@ export interface LaunchTemplateConfig extends BaseComponentConfig {
   maxFileSize?: string;
   maxMcycleLimit?: string;
   maxConcurrentProofs?: number;
+  maxJournalBytes?: number;
   balanceWarnThreshold?: string;
   balanceErrorThreshold?: string;
   collateralBalanceWarnThreshold?: string;
@@ -148,6 +149,7 @@ export class LaunchTemplateComponent extends BaseComponent {
       config.maxFileSize || "500000000000",
       config.maxMcycleLimit || "1000000000000",
       config.maxConcurrentProofs || 1,
+      config.maxJournalBytes || 20000,
       config.balanceWarnThreshold || "50",
       config.balanceErrorThreshold || "100",
       config.collateralBalanceWarnThreshold || "50",
@@ -155,7 +157,7 @@ export class LaunchTemplateComponent extends BaseComponent {
       config.maxFetchRetries || 3,
       config.allowClientAddresses || "",
       config.lockinPriorityGas || "0",
-    ]).apply(([dbName, dbUser, dbPass, rpcUrl, privKey, orderStreamUrl, verifierAddress, boundlessMarketAddress, setVerifierAddress, collateralTokenAddress, chainId, stackName, componentType, rdsEndpoint, s3BucketName, s3AccessKeyId, s3SecretAccessKey, mcyclePrice, peakProveKhz, minDeadline, lookbackBlocks, maxCollateral, maxFileSize, maxMcycleLimit, maxConcurrentProofs, balanceWarnThreshold, balanceErrorThreshold, collateralBalanceWarnThreshold, collateralBalanceErrorThreshold, maxFetchRetries, allowClientAddresses, lockinPriorityGas]) => {
+    ]).apply(([dbName, dbUser, dbPass, rpcUrl, privKey, orderStreamUrl, verifierAddress, boundlessMarketAddress, setVerifierAddress, collateralTokenAddress, chainId, stackName, componentType, rdsEndpoint, s3BucketName, s3AccessKeyId, s3SecretAccessKey, mcyclePrice, peakProveKhz, minDeadline, lookbackBlocks, maxCollateral, maxFileSize, maxMcycleLimit, maxConcurrentProofs, maxJournalBytes, balanceWarnThreshold, balanceErrorThreshold, collateralBalanceWarnThreshold, collateralBalanceErrorThreshold, maxFetchRetries, allowClientAddresses, lockinPriorityGas]) => {
       // Extract host from endpoints (format: host:port)
       const rdsEndpointStr = String(rdsEndpoint);
       const rdsHost = rdsEndpointStr.split(':')[0];
@@ -174,6 +176,7 @@ max_collateral = "${maxCollateral}"
 max_file_size = ${maxFileSize}
 max_mcycle_limit = ${maxMcycleLimit}
 max_concurrent_proofs = ${maxConcurrentProofs}
+max_journal_bytes = ${maxJournalBytes}
 balance_warn_threshold = "${balanceWarnThreshold}"
 balance_error_threshold = "${balanceErrorThreshold}"
 collateral_balance_warn_threshold = "${collateralBalanceWarnThreshold}"
@@ -305,6 +308,8 @@ runcmd:
     cat /etc/environment.d/bento.conf >> /etc/environment
   - |
     /usr/bin/sed -i 's|group_name: "/boundless/bent.*"|group_name: "/boundless/bento/${stackName}/${componentType}"|g' /etc/vector/vector.yaml
+  - |
+    echo "VECTOR_LOG=debug" >> /etc/default/vector
   - |
     /usr/bin/sed -i 's|"namespace": "Boundless/Services/bent.*",|"namespace": "Boundless/Services/${stackName}/bento-${componentType}",|g' /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
   - |
@@ -438,7 +443,10 @@ echo "AWS_REGION=us-west-2" >> /etc/environment
 echo "REDIS_TTL=57600" >> /etc/environment
 echo "STACK_NAME=${stackName}" >> /etc/environment
 echo "COMPONENT_TYPE=${componentType}" >> /etc/environment
+
 /usr/bin/sed -i 's|group_name: "/boundless/bent.*"|group_name: "/boundless/bento/${stackName}/${componentType}"|g' /etc/vector/vector.yaml
+echo "VECTOR_LOG=debug" >> /etc/default/vector
+
 /usr/bin/sed -i 's|"namespace": "Boundless/Services/bent.*",|"namespace": "Boundless/Services/${stackName}/bento-${componentType}-cluster",|g' /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
 
 # Add CloudWatch agent configuration common to all worker clusters
