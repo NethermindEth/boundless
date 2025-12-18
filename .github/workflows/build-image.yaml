@@ -1,0 +1,125 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches: [release-1.2]
+    tags: ["v*"]
+
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  attestations: write
+  contents: read
+
+jobs:
+  # Check which files have changed
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      agent: ${{ steps.filter.outputs.agent }}
+      broker: ${{ steps.filter.outputs.broker }}
+      rest_api: ${{ steps.filter.outputs.rest_api }}
+      base: ${{ steps.filter.outputs.base }}
+      cli: ${{ steps.filter.outputs.cli }}
+      boundless_version: "v1.2.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            agent:
+              - 'dockerfiles/agent.prebuilt.dockerfile'
+              - 'bento/**'
+            broker:
+              - 'dockerfiles/broker.prebuilt.dockerfile'
+              - 'crates/broker/**'
+            rest_api:
+              - 'dockerfiles/rest_api.prebuilt.dockerfile'
+              - 'bento/**'
+            base:
+              - 'base.Dockerfile'
+            cli:
+              - 'boundless_cli.Dockerfile'
+              - 'base.Dockerfile'
+              - 'crates/boundless-cli/**'
+
+  build_agent:
+    needs: changes
+    if: ${{ needs.changes.outputs.agent == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch' }}
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
+    with:
+      group_name: "angkor"
+      runner: ubuntu-gigachad
+      image_name: "boundless-agent"
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "dockerfiles/agent.prebuilt.dockerfile"
+      platforms: "linux/amd64"
+      run_trivy: false
+      docker_build_args: |
+        BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-${{ needs.changes.outputs.boundless_version }}/bento-bundle-linux-amd64.tar.gz
+        BLAKE3_GROTH16_ARTIFACTS_URL=https://staging-signal-artifacts.beboundless.xyz/v3/proving/blake3_groth16_artifacts.tar.xz
+        USE_LOCAL_BLAKE3_GROTH16_SETUP=0
+
+  build_broker:
+    needs: changes
+    if: ${{ needs.changes.outputs.broker == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch' }}
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
+    with:
+      group_name: "angkor"
+      runner: ubuntu-gigachad
+      image_name: "boundless-broker"
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "dockerfiles/broker.prebuilt.dockerfile"
+      platforms: "linux/amd64"
+      run_trivy: false
+      docker_build_args: "BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/broker-${{ needs.changes.outputs.boundless_version }}/broker"
+
+  build_rest_api:
+    needs: changes
+    if: ${{ needs.changes.outputs.rest_api == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch' }}
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-jfrog.yaml@main
+    with:
+      group_name: "angkor"
+      runner: ubuntu-gigachad
+      image_name: "boundless-rest-api"
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "dockerfiles/rest_api.prebuilt.dockerfile"
+      platforms: "linux/amd64"
+      run_trivy: false
+      docker_build_args: |
+        BINARY_URL=https://github.com/boundless-xyz/boundless/releases/download/bento-${{ needs.changes.outputs.boundless_version }}/bento-bundle-linux-amd64.tar.gz
+
+  build_base:
+    needs: changes
+    if: ${{ needs.changes.outputs.base == 'true' }}
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-dockerhub.yaml@main
+    with:
+      runner: ubuntu-gigachad
+      image_name: boundless-base
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "base.Dockerfile"
+      platforms: "linux/amd64,linux/arm64"
+      run_trivy: false
+      additional_tags: "${{ needs.changes.outputs.boundless_version }}"
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
+      dockerhub_password: ${{ secrets.DOCKER_HUB_PASSWORD }}
+
+  build_cli:
+    needs: [changes, build_base]
+    if: ${{ always() && !cancelled() && (needs.changes.outputs.cli == 'true' || github.ref_type == 'tag' || github.event_name == 'dispatch') && (needs.build_base.result == 'success' || needs.build_base.result == 'skipped') }}
+    uses: NethermindEth/github-workflows/.github/workflows/docker-build-push-dockerhub.yaml@main
+    with:
+      runner: ubuntu-gigachad
+      image_name: boundless-cli
+      push: ${{ github.event_name != 'pull_request' }}
+      dockerfile_path: "boundless_cli.Dockerfile"
+      docker_build_args: "BUILD_UNIQUE_ID=${{ github.run_id }}_${{ github.run_attempt }}"
+      platforms: "linux/amd64,linux/arm64"
+      run_trivy: false
+      additional_tags: "${{ needs.changes.outputs.boundless_version }}"
+    secrets:
+      dockerhub_username: ${{ secrets.DOCKER_HUB_USERNAME }}
+      dockerhub_password: ${{ secrets.DOCKER_HUB_PASSWORD }}
