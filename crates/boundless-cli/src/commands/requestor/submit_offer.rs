@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,9 @@
 use alloy::primitives::{Address, U256};
 use anyhow::{anyhow, bail, Context, Result};
 use boundless_market::{
-    contracts::Selector,
     input::GuestEnvBuilder,
     request_builder::{OfferParams as OfferParamsStruct, RequirementParams},
-    selector::ProofType,
+    selector::{ProofType, SelectorExt},
     storage::StorageProviderConfig,
 };
 use clap::Args;
@@ -170,8 +169,13 @@ impl RequestorSubmitOffer {
             }
         }
         match self.requirements.proof_type {
-            ProofType::Inclusion => requirements.selector(Selector::set_inclusion_latest() as u32),
-            ProofType::Groth16 => requirements.selector(Selector::groth16_latest() as u32),
+            ProofType::Inclusion => {
+                requirements.selector(SelectorExt::set_inclusion_latest() as u32)
+            }
+            ProofType::Groth16 => requirements.selector(SelectorExt::groth16_latest() as u32),
+            ProofType::Blake3Groth16 => {
+                requirements.selector(SelectorExt::blake3_groth16_latest() as u32)
+            }
             ProofType::Any => &mut requirements,
             ty => bail!("unsupported proof type provided in proof-type flag: {:?}", ty),
         };

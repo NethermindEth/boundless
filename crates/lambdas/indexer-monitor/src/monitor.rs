@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,22 +17,21 @@ use std::str::FromStr;
 use alloy::primitives::Address;
 use anyhow::Result;
 use sqlx::{
-    any::{install_default_drivers, AnyConnectOptions, AnyPoolOptions},
-    AnyPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
+    PgPool, Row,
 };
 
 /// The `monitoring` struct provides functionality to monitor and query the indexer database.
 pub struct Monitor {
     /// The database connection pool.
-    pub db: AnyPool,
+    pub db: PgPool,
 }
 
 impl Monitor {
     /// Creates a new instance of the Monitor.
     pub async fn new(conn: &str) -> Result<Self> {
-        install_default_drivers();
-        let opts = AnyConnectOptions::from_str(conn)?;
-        let pool = AnyPoolOptions::new().max_connections(5).connect_with(opts).await?;
+        let opts = PgConnectOptions::from_str(conn)?;
+        let pool = PgPoolOptions::new().max_connections(5).connect_with(opts).await?;
 
         let db = pool;
         Ok(Self { db })
@@ -180,7 +179,6 @@ impl Monitor {
     /// Fetch the requests that have been submitted within the given range from a specific client address.
     /// NOTE: This function queries the `proof_requests` table, not the `request_submitted_events` table,
     ///       because the `request_submitted_events` table is not updated when a request is submitted offchain.
-    ///       This is therefore an approximation of when requests were submitted.
     ///
     /// from: timestamp in seconds.
     /// to: timestamp in seconds.
@@ -257,11 +255,13 @@ impl Monitor {
     ) -> Result<Vec<String>> {
         let rows = sqlx::query(
             r#"
-            SELECT request_id
-            FROM request_fulfilled_events
-            WHERE block_timestamp >= $1
-            AND block_timestamp < $2
-            AND client_address = $3
+            SELECT rfe.request_id
+            FROM request_fulfilled_events rfe
+            JOIN proof_requests pr
+              ON rfe.request_digest = pr.request_digest
+            WHERE rfe.block_timestamp >= $1
+            AND rfe.block_timestamp < $2
+            AND pr.client_address = $3
             "#,
         )
         .bind(from)
@@ -303,11 +303,18 @@ impl Monitor {
 
     /// Total number of fulfilled requests from a specific client address.
     pub async fn total_fulfilled_requests_from_client(&self, address: Address) -> Result<i64> {
-        let row =
-            sqlx::query("SELECT COUNT(*) FROM request_fulfilled_events WHERE client_address = $1")
-                .bind(format!("{address:x}"))
-                .fetch_one(&self.db)
-                .await?;
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)
+            FROM request_fulfilled_events rfe
+            JOIN proof_requests pr
+              ON rfe.request_digest = pr.request_digest
+            WHERE pr.client_address = $1
+            "#,
+        )
+        .bind(format!("{address:x}"))
+        .fetch_one(&self.db)
+        .await?;
         Ok(row.get::<i64, _>(0))
     }
 

@@ -13,9 +13,9 @@ export interface ManagerComponentConfig extends BaseComponentConfig {
     taskDBName: string;
     taskDBUsername: string;
     taskDBPassword: string;
-    ethRpcUrl: pulumi.Output<string>;
+    brokerRpcUrls: pulumi.Output<string>;
     privateKey: pulumi.Output<string>;
-    orderStreamUrl: string;
+    orderStreamUrl: pulumi.Output<string>;
     verifierAddress: string;
     boundlessMarketAddress: string;
     setVerifierAddress: string;
@@ -35,6 +35,7 @@ export interface ManagerComponentConfig extends BaseComponentConfig {
     maxFileSize: string;
     maxMcycleLimit: string;
     maxConcurrentProofs: number;
+    maxConcurrentPreflights: number;
     maxJournalBytes: number;
     balanceWarnThreshold: string;
     balanceErrorThreshold: string;
@@ -43,8 +44,10 @@ export interface ManagerComponentConfig extends BaseComponentConfig {
     priorityRequestorAddresses: string;
     denyRequestorAddresses: string;
     maxFetchRetries: number;
-    allowClientAddresses: string;
+    allowRequestorLists: string;
     lockinPriorityGas: string;
+    orderCommitmentPriority: string;
+    rustLogLevel: string;
 }
 
 export class ManagerComponent extends BaseComponent {

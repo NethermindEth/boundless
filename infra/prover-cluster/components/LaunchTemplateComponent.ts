@@ -12,9 +12,8 @@ export interface LaunchTemplateConfig extends BaseComponentConfig {
   taskDBName: string;
   taskDBUsername: string;
   taskDBPassword: string;
-  ethRpcUrl?: pulumi.Output<string>;
   privateKey?: pulumi.Output<string>;
-  orderStreamUrl?: string;
+  orderStreamUrl?: pulumi.Output<string>;
   verifierAddress?: string;
   boundlessMarketAddress?: string;
   setVerifierAddress?: string;
@@ -28,6 +27,7 @@ export interface LaunchTemplateConfig extends BaseComponentConfig {
   s3AccessKeyId?: pulumi.Output<string>;
   s3SecretAccessKey?: pulumi.Output<string>;
   // Broker configuration
+  brokerRpcUrls?: pulumi.Output<string>;
   mcyclePrice?: string;
   peakProveKhz?: number;
   minDeadline?: number;
@@ -36,6 +36,7 @@ export interface LaunchTemplateConfig extends BaseComponentConfig {
   maxFileSize?: string;
   maxMcycleLimit?: string;
   maxConcurrentProofs?: number;
+  maxConcurrentPreflights?: number;
   maxJournalBytes?: number;
   balanceWarnThreshold?: string;
   balanceErrorThreshold?: string;
@@ -44,8 +45,10 @@ export interface LaunchTemplateConfig extends BaseComponentConfig {
   priorityRequestorAddresses?: string;
   denyRequestorAddresses?: string;
   maxFetchRetries?: number;
-  allowClientAddresses?: string;
+  allowRequestorLists?: string;
   lockinPriorityGas?: string;
+  orderCommitmentPriority?: string;
+  rustLogLevel?: string;
 }
 
 export class LaunchTemplateComponent extends BaseComponent {
@@ -127,7 +130,6 @@ export class LaunchTemplateComponent extends BaseComponent {
       config.taskDBName,
       config.taskDBUsername,
       config.taskDBPassword,
-      config.ethRpcUrl!,
       config.privateKey!,
       config.orderStreamUrl!,
       config.verifierAddress!,
@@ -141,6 +143,7 @@ export class LaunchTemplateComponent extends BaseComponent {
       config.s3BucketName!,
       config.s3AccessKeyId!,
       config.s3SecretAccessKey!,
+      config.brokerRpcUrls!,
       config.mcyclePrice || "0.00000001",
       config.peakProveKhz || 100,
       config.minDeadline || 0,
@@ -149,15 +152,19 @@ export class LaunchTemplateComponent extends BaseComponent {
       config.maxFileSize || "500000000000",
       config.maxMcycleLimit || "1000000000000",
       config.maxConcurrentProofs || 1,
+      config.maxConcurrentPreflights || 2,
       config.maxJournalBytes || 20000,
       config.balanceWarnThreshold || "50",
       config.balanceErrorThreshold || "100",
       config.collateralBalanceWarnThreshold || "50",
       config.collateralBalanceErrorThreshold || "100",
       config.maxFetchRetries || 3,
-      config.allowClientAddresses || "",
+      config.allowRequestorLists || "",
       config.lockinPriorityGas || "0",
-    ]).apply(([dbName, dbUser, dbPass, rpcUrl, privKey, orderStreamUrl, verifierAddress, boundlessMarketAddress, setVerifierAddress, collateralTokenAddress, chainId, stackName, componentType, rdsEndpoint, s3BucketName, s3AccessKeyId, s3SecretAccessKey, mcyclePrice, peakProveKhz, minDeadline, lookbackBlocks, maxCollateral, maxFileSize, maxMcycleLimit, maxConcurrentProofs, maxJournalBytes, balanceWarnThreshold, balanceErrorThreshold, collateralBalanceWarnThreshold, collateralBalanceErrorThreshold, maxFetchRetries, allowClientAddresses, lockinPriorityGas]) => {
+      config.orderCommitmentPriority || "cycle_price",
+      config.rustLogLevel || "debug",
+    ]).apply(([dbName, dbUser, dbPass, privKey, orderStreamUrl, verifierAddress, boundlessMarketAddress, setVerifierAddress, collateralTokenAddress, chainId, stackName, componentType, rdsEndpoint, s3BucketName, s3AccessKeyId, s3SecretAccessKey, brokerRpcUrls, mcyclePrice, peakProveKhz, minDeadline, lookbackBlocks, maxCollateral, maxFileSize, maxMcycleLimit, maxConcurrentProofs, maxConcurrentPreflights, maxJournalBytes, balanceWarnThreshold, balanceErrorThreshold, collateralBalanceWarnThreshold, collateralBalanceErrorThreshold, maxFetchRetries, allowRequestorLists, lockinPriorityGas, orderCommitmentPriority, rustLogLevel]) => {
+      const brokerRpcUrlsStr = brokerRpcUrls;
       // Extract host from endpoints (format: host:port)
       const rdsEndpointStr = String(rdsEndpoint);
       const rdsHost = rdsEndpointStr.split(':')[0];
@@ -182,11 +189,13 @@ balance_error_threshold = "${balanceErrorThreshold}"
 collateral_balance_warn_threshold = "${collateralBalanceWarnThreshold}"
 collateral_balance_error_threshold = "${collateralBalanceErrorThreshold}"
 max_fetch_retries = ${maxFetchRetries}
-${allowClientAddresses ? `allow_client_addresses = ${allowClientAddresses}\n` : ''}
+${allowRequestorLists ? `allowed_requestor_lists = ${allowRequestorLists}\n` : ''}
 ${lockinPriorityGas ? `lockin_priority_gas = ${lockinPriorityGas}\n` : ''}
+order_commitment_priority = "${orderCommitmentPriority}"
 priority_requestor_lists = [
 	"https://requestors.boundless.network/boundless-recommended-priority-list.standard.json",
 ]
+max_concurrent_preflights = ${Number(maxConcurrentPreflights) - Number(maxConcurrentProofs)}
 
 [prover]
 status_poll_retry_count = 3
@@ -248,7 +257,7 @@ ${aggregationDimensionsJson.split('\n').map(line => `      ${line}`).join('\n')}
 
   - path: /etc/environment.d/bento.conf
     content: |
-      RUST_LOG=info
+      RUST_LOG=${rustLogLevel}
       BENTO_API_LISTEN_ADDR=0.0.0.0
       BENTO_API_PORT=8081
       SNARK_TIMEOUT=1800
@@ -267,9 +276,8 @@ ${aggregationDimensionsJson.split('\n').map(line => `      ${line}`).join('\n')}
       AWS_REGION=us-west-2
       STACK_NAME=${stackName}
       COMPONENT_TYPE=${componentType}
-      PROVER_RPC_URL=${rpcUrl}
+      PROVER_RPC_URLS=${brokerRpcUrlsStr}
       PROVER_PRIVATE_KEY=${privKey}
-      RPC_URL=${rpcUrl}
       PRIVATE_KEY=${privKey}
       ORDER_STREAM_URL=${orderStreamUrl}
       VERIFIER_ADDRESS=${verifierAddress}
@@ -343,8 +351,9 @@ runcmd:
       config.rdsEndpoint!,
       config.s3BucketName!,
       config.s3AccessKeyId!,
-      config.s3SecretAccessKey!
-    ]).apply(([managerIp, dbName, dbUser, dbPass, stackName, componentType, rdsEndpoint, s3BucketName, s3AccessKeyId, s3SecretAccessKey]) => {
+      config.s3SecretAccessKey!,
+      config.rustLogLevel || "debug",
+    ]).apply(([managerIp, dbName, dbUser, dbPass, stackName, componentType, rdsEndpoint, s3BucketName, s3AccessKeyId, s3SecretAccessKey, rustLogLevel]) => {
       // Extract host from endpoints (format: host:port)
       const rdsEndpointStr = String(rdsEndpoint);
       const rdsHost = rdsEndpointStr.split(':')[0];
@@ -352,7 +361,7 @@ runcmd:
       // Workers connect to Redis/Valkey on the manager node
       const redisHost = managerIp;
       const redisPort = "6379";
-      const commonEnvVars = this.generateCommonEnvVars(managerIp, dbName, dbUser, dbPass, stackName, componentType, rdsHost, rdsPort, redisHost, redisPort, s3BucketName, s3AccessKeyId, s3SecretAccessKey);
+      const commonEnvVars = this.generateCommonEnvVars(managerIp, dbName, dbUser, dbPass, stackName, componentType, rdsHost, rdsPort, redisHost, redisPort, s3BucketName, s3AccessKeyId, s3SecretAccessKey, rustLogLevel);
 
       let componentSpecificVars = "";
       let serviceFile = "";
@@ -428,13 +437,14 @@ systemctl enable bento.service`;
     s3BucketName: string,
     s3AccessKeyId: string,
     s3SecretAccessKey: string,
+    rustLogLevel: string,
   ): string {
     return `# Database and Redis URLs (AWS services)
 echo "DATABASE_URL=postgresql://${dbUser}:${dbPass}@${rdsHost}:${rdsPort}/${dbName}" >> /etc/environment
 echo "REDIS_URL=redis://${redisHost}:${redisPort}" >> /etc/environment
 
 # S3 Configuration - using AWS S3
-echo "RUST_LOG=info" >> /etc/environment
+echo "RUST_LOG=${rustLogLevel}" >> /etc/environment
 echo "S3_BUCKET=${s3BucketName}" >> /etc/environment
 echo "S3_URL=https://s3.us-west-2.amazonaws.com" >> /etc/environment
 echo "S3_ACCESS_KEY=${s3AccessKeyId}" >> /etc/environment

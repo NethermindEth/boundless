@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use alloy::network::{AnyNetwork, Ethereum};
 use alloy::primitives::{B256, U256};
 use alloy::providers::Provider;
 use boundless_market::contracts::pricing::price_at_time;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 impl<P, ANP> IndexerService<P, ANP>
@@ -103,7 +103,72 @@ where
             (None, None)
         };
 
-        RequestStatus {
+        // Compute effective_prove_mhz: proving speed performance from the requestor's perspective
+        // total_cycles / (proof_delivery_time * 1_000_000)
+        // proof_delivery_time = fulfilled_at - created_at (in seconds)
+        let effective_prove_mhz = req
+            .fulfilled_at
+            .zip(req.total_cycles)
+            .filter(|(fulfilled_at, total_cycles)| {
+                *fulfilled_at > req.created_at && *total_cycles > U256::ZERO
+            })
+            .and_then(|(fulfilled_at, total_cycles)| {
+                let proof_delivery_time = fulfilled_at - req.created_at;
+                // Calculate: total_cycles / (proof_delivery_time * 1_000_000)
+                if proof_delivery_time > 0 {
+                    // Convert U256 to f64 by converting to string first, then parsing
+                    let total_cycles_f64 = total_cycles.to_string().parse::<f64>().unwrap_or(0.0);
+                    let mhz = total_cycles_f64 / (proof_delivery_time as f64 * 1_000_000.0);
+                    Some(mhz)
+                } else {
+                    None
+                }
+            });
+
+        // Compute prover_effective_prove_mhz: measures prover performance from their perspective
+        // - Primary fulfillment (lock holder): total_cycles / (fulfilled_at - locked_at)
+        // - Secondary fulfillment (lock expired + different prover): total_cycles / (fulfilled_at - lock_end)
+        // - No lock fallback: total_cycles / (fulfilled_at - created_at)
+        let prover_effective_prove_mhz = req
+            .fulfilled_at
+            .zip(req.total_cycles)
+            .filter(|(_, total_cycles)| *total_cycles > U256::ZERO)
+            .and_then(|(fulfilled_at, total_cycles)| {
+                let total_cycles_f64 = total_cycles.to_string().parse::<f64>().unwrap_or(0.0);
+
+                // Primary fulfillment: lock holder fulfills
+                if req.lock_prover_address.is_some()
+                    && req.lock_prover_address == req.fulfill_prover_address
+                {
+                    if let Some(locked_at) = req.locked_at {
+                        let prove_time = fulfilled_at.saturating_sub(locked_at);
+                        if prove_time > 0 {
+                            return Some(total_cycles_f64 / (prove_time as f64 * 1_000_000.0));
+                        }
+                    }
+                }
+                // Secondary fulfillment: lock expired and different prover fulfilled
+                else if fulfilled_at > req.lock_end
+                    && req.lock_prover_address != req.fulfill_prover_address
+                {
+                    let prove_time = fulfilled_at.saturating_sub(req.lock_end);
+                    if prove_time > 0 {
+                        return Some(total_cycles_f64 / (prove_time as f64 * 1_000_000.0));
+                    }
+                }
+                // No lock fallback: fulfilled without being locked, or any other edge case
+                else if req.locked_at.is_none() && fulfilled_at > req.created_at {
+                    let prove_time = fulfilled_at - req.created_at;
+                    if prove_time > 0 {
+                        return Some(total_cycles_f64 / (prove_time as f64 * 1_000_000.0));
+                    }
+                }
+
+                None
+            });
+
+        #[allow(deprecated)]
+        let status = RequestStatus {
             request_digest: req.request_digest,
             request_id: req.request_id,
             request_status,
@@ -134,8 +199,9 @@ where
             slash_burned_amount: req.slash_burned_amount,
             program_cycles: req.program_cycles,
             total_cycles: req.total_cycles,
-            peak_prove_mhz: req.peak_prove_mhz,
-            effective_prove_mhz: req.effective_prove_mhz,
+            peak_prove_mhz: None,
+            effective_prove_mhz,
+            prover_effective_prove_mhz,
             cycle_status: req.cycle_status,
             lock_price,
             lock_price_per_cycle,
@@ -152,7 +218,8 @@ where
             input_data: req.input_data,
             fulfill_journal: req.fulfill_journal,
             fulfill_seal: req.fulfill_seal,
-        }
+        };
+        status
     }
 
     pub(super) async fn update_request_statuses(
@@ -160,7 +227,8 @@ where
         request_digests: HashSet<B256>,
         block_number: u64,
     ) -> Result<(), ServiceError> {
-        tracing::debug!(
+        tracing::debug!("{} request digests to update", request_digests.len());
+        tracing::trace!(
             "Request digests to update: {:?}",
             request_digests.iter().map(|d| format!("0x{:x}", d)).collect::<Vec<_>>()
         );
@@ -189,10 +257,22 @@ where
         tracing::info!("get_requests_comprehensive completed in {:?} [queried with {} digests, {} requests found]", start_get_requests_comprehensive.elapsed(), request_digests.len(), requests_with_events.len());
 
         let start_compute_request_status = std::time::Instant::now();
-        let request_statuses: Vec<_> = requests_with_events
+        let mut request_statuses: Vec<_> = requests_with_events
             .into_iter()
             .map(|req| self.compute_request_status(req, current_timestamp))
             .collect();
+
+        let cycle_counts = self.db.get_cycle_counts(&request_digests).await?;
+        let cycle_counts_map: HashMap<_, _> =
+            cycle_counts.into_iter().map(|cc| (cc.request_digest, cc)).collect();
+
+        for status in request_statuses.iter_mut() {
+            if let Some(cc) = cycle_counts_map.get(&status.request_digest) {
+                status.cycle_status = Some(cc.cycle_status.clone());
+                status.program_cycles = cc.program_cycles;
+                status.total_cycles = cc.total_cycles;
+            }
+        }
 
         tracing::info!(
             "compute_request_status completed in {:?} [{} statuses computed]",

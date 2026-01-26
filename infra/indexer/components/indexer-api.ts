@@ -5,6 +5,13 @@ import * as crypto from 'crypto';
 import { createRustLambda } from './rust-lambda';
 import { Severity } from '../../util';
 
+// WAF rate-based rules are evaluated per 5-minute window.
+const RATE_LIMIT_PER_5_MINUTES = 200;
+const ALLOWED_IP_RATE_LIMIT_PER_5_MINUTES = 1000;
+// Header names must be lowercase for WAFv2 `singleHeader` matching.
+const PROXY_SECRET_HEADER_NAME = 'x-boundless-proxy-secret';
+const FORWARDED_IP_HEADER_NAME = 'x-forwarded-for';
+
 export interface IndexerApiArgs {
   /** VPC where RDS lives */
   vpcId: pulumi.Input<string>;
@@ -24,10 +31,14 @@ export interface IndexerApiArgs {
   chainId: pulumi.Input<string>;
   /** Optional custom domain for CloudFront */
   domain?: pulumi.Input<string>;
+  /** Proxy secret value used to decide whether to trust forwarded client IP headers */
+  proxySecret: pulumi.Input<string>;
   /** Boundless alerts topic ARNs */
   boundlessAlertsTopicArns?: string[];
   /** Database version */
   databaseVersion?: string;
+  /** Optional comma-separated list of IP addresses to allow higher rate limit (1000 per 5 minutes) */
+  allowedIpAddresses?: pulumi.Input<string>;
 }
 
 export class IndexerApi extends pulumi.ComponentResource {
@@ -140,7 +151,6 @@ export class IndexerApi extends pulumi.ComponentResource {
       },
       memorySize: 256,
       timeout: 30,
-      reservedConcurrentExecutions: 10,
       vpcConfig: {
         subnetIds: args.privSubNetIds,
         securityGroupIds: [args.indexerSgId],
@@ -153,17 +163,28 @@ export class IndexerApi extends pulumi.ComponentResource {
     // Create error log metric filter and alarm
     const alarmActions = args.boundlessAlertsTopicArns ?? [];
 
+    const errorLogMetricName = `${serviceName}-log-err`;
     new aws.cloudwatch.LogMetricFilter(`${serviceName}-error-filter`, {
       name: `${serviceName}-log-err-filter`,
       logGroupName: logGroupName,
       metricTransformation: {
         namespace: `Boundless/Services/${serviceName}`,
-        name: `${serviceName}-log-err`,
+        name: errorLogMetricName,
         value: '1',
         defaultValue: '0',
       },
       pattern: '?ERROR ?error ?Error',
     }, { dependsOn: [this.lambdaFunction], parent: this });
+
+    const stackName = pulumi.getStack();
+    const stage = stackName.includes('prod') ? 'prod' : 'staging';
+    const chainIdOutput = pulumi.output(args.chainId);
+    const alarmTags = pulumi.all([chainIdOutput, logGroupName]).apply(([chainId, logGroup]) => ({
+      StackName: stage,
+      ChainId: chainId,
+      ServiceName: serviceName,
+      LogGroupName: logGroup,
+    }));
 
     new aws.cloudwatch.MetricAlarm(`${serviceName}-${Severity.SEV2}-error-alarm`, {
       name: `${serviceName}-${Severity.SEV2}-log-err`,
@@ -172,7 +193,7 @@ export class IndexerApi extends pulumi.ComponentResource {
           id: 'm1',
           metric: {
             namespace: `Boundless/Services/${serviceName}`,
-            metricName: `${serviceName}-log-err`,
+            metricName: errorLogMetricName,
             period: 300,
             stat: 'Sum',
           },
@@ -187,23 +208,7 @@ export class IndexerApi extends pulumi.ComponentResource {
       alarmDescription: `Indexer API Lambda (${serviceName}) ${Severity.SEV2} log ERROR level (2 errors within 20 mins)`,
       actionsEnabled: true,
       alarmActions,
-    }, { parent: this });
-
-    // Alarm for Lambda Concurrent Executions approaching limit
-    new aws.cloudwatch.MetricAlarm(`${serviceName}-lambda-concurrent-executions`, {
-      name: `${serviceName}-lambda-concurrent-executions`,
-      comparisonOperator: 'GreaterThanThreshold',
-      evaluationPeriods: 2,
-      metricName: 'ConcurrentExecutions',
-      namespace: 'AWS/Lambda',
-      period: 60, // 1 minute
-      statistic: 'Maximum',
-      threshold: 20, // Alert at 20 concurrent executions (80% of 25 limit)
-      alarmDescription: `Lambda concurrent executions approaching reserved limit of 25`,
-      dimensions: {
-        FunctionName: lambda.name,
-      },
-      treatMissingData: 'notBreaching',
+      tags: alarmTags,
     }, { parent: this });
 
     // Create API Gateway v2 (HTTP API)
@@ -249,16 +254,58 @@ export class IndexerApi extends pulumi.ComponentResource {
       { parent: this },
     );
 
-    // Create deployment stage
+    // Create CloudWatch log group for API Gateway access logs
+    const accessLogGroup = new aws.cloudwatch.LogGroup(
+      `${serviceName}-api-access-logs`,
+      {
+        name: `/aws/apigateway/${serviceName}`,
+        retentionInDays: 30,
+      },
+      { parent: this },
+    );
+
+    // Create deployment stage with access logging
     new aws.apigatewayv2.Stage(
       `${serviceName}-stage`,
       {
         apiId: api.id,
         name: '$default',
         autoDeploy: true,
+        accessLogSettings: {
+          destinationArn: accessLogGroup.arn,
+          format: JSON.stringify({
+            requestId: '$context.requestId',
+            ip: '$context.identity.sourceIp',
+            requestTime: '$context.requestTime',
+            httpMethod: '$context.httpMethod',
+            path: '$context.path',
+            status: '$context.status',
+            responseLength: '$context.responseLength',
+            integrationLatency: '$context.integrationLatency',
+            integrationError: '$context.integrationErrorMessage',
+          }),
+        },
       },
       { parent: this },
     );
+
+    // Alarm for API Gateway 5xx errors
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-5xx-alarm`, {
+      name: `${serviceName}-5xx-errors`,
+      comparisonOperator: 'GreaterThanThreshold',
+      evaluationPeriods: 2,
+      metricName: '5xx',
+      namespace: 'AWS/ApiGateway',
+      period: 60,
+      statistic: 'Sum',
+      threshold: 10,
+      alarmDescription: `API Gateway 5xx errors detected for ${serviceName}`,
+      dimensions: {
+        ApiId: api.id,
+      },
+      treatMissingData: 'notBreaching',
+      alarmActions,
+    }, { parent: this });
 
     this.apiEndpoint = pulumi.interpolate`${api.apiEndpoint}`;
 
@@ -314,6 +361,171 @@ export class IndexerApi extends pulumi.ComponentResource {
       distributionAliases = [args.domain];
     }
 
+    // Parse comma-separated IP addresses and always create IP set
+    const parsedIpAddresses = args.allowedIpAddresses
+      ? pulumi.output(args.allowedIpAddresses).apply(ips =>
+        ips.split(',').map(ip => ip.trim()).filter(ip => ip.length > 0)
+      )
+      : pulumi.output([]);
+
+    const allowedIpSet = parsedIpAddresses.apply(ips =>
+      new aws.wafv2.IpSet(
+        `${serviceName}-allowed-ip`,
+        {
+          name: `${serviceName}-allowed-ip`,
+          scope: 'CLOUDFRONT',
+          addresses: ips,
+          ipAddressVersion: 'IPV4',
+        },
+        { parent: this, provider: usEast1Provider },
+      )
+    );
+
+    // Build WAF rules array - always include allowed IP rule at priority 0
+    const allRules = allowedIpSet.apply(ipSet => [
+      {
+        name: 'AllowedIpRateLimit',
+        priority: 0,
+        statement: {
+          rateBasedStatement: {
+            limit: ALLOWED_IP_RATE_LIMIT_PER_5_MINUTES,
+            aggregateKeyType: 'IP',
+            scopeDownStatement: {
+              ipSetReferenceStatement: {
+                arn: ipSet.arn,
+              },
+            },
+          },
+        },
+        action: { block: {} },
+        visibilityConfig: {
+          sampledRequestsEnabled: true,
+          cloudwatchMetricsEnabled: true,
+          metricName: 'AllowedIpRateLimit',
+        },
+      },
+      // If proxy secret matches, rate limit by forwarded client IP (from X-Forwarded-For)
+      {
+        name: 'ProxyForwardedIpRateLimit',
+        priority: 1,
+        statement: {
+          rateBasedStatement: {
+            limit: RATE_LIMIT_PER_5_MINUTES,
+            aggregateKeyType: 'FORWARDED_IP',
+            forwardedIpConfig: {
+              headerName: FORWARDED_IP_HEADER_NAME,
+              fallbackBehavior: 'NO_MATCH',
+            },
+            scopeDownStatement: {
+              byteMatchStatement: {
+                searchString: args.proxySecret,
+                fieldToMatch: {
+                  singleHeader: { name: PROXY_SECRET_HEADER_NAME },
+                },
+                positionalConstraint: 'EXACTLY',
+                textTransformations: [{ priority: 0, type: 'NONE' }],
+              },
+            },
+          },
+        },
+        action: { block: {} },
+        visibilityConfig: {
+          sampledRequestsEnabled: true,
+          cloudwatchMetricsEnabled: true,
+          metricName: 'ProxyForwardedIpRateLimit',
+        },
+      },
+      // If proxy secret does NOT match, rate limit by true source IP
+      {
+        name: 'SourceIpRateLimit',
+        priority: 2,
+        statement: {
+          rateBasedStatement: {
+            limit: RATE_LIMIT_PER_5_MINUTES,
+            aggregateKeyType: 'IP',
+            scopeDownStatement: {
+              notStatement: {
+                statements: [
+                  {
+                    byteMatchStatement: {
+                      searchString: args.proxySecret,
+                      fieldToMatch: {
+                        singleHeader: { name: PROXY_SECRET_HEADER_NAME },
+                      },
+                      positionalConstraint: 'EXACTLY',
+                      textTransformations: [{ priority: 0, type: 'NONE' }],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        },
+        action: { block: {} },
+        visibilityConfig: {
+          sampledRequestsEnabled: true,
+          cloudwatchMetricsEnabled: true,
+          metricName: 'SourceIpRateLimit',
+        },
+      },
+      // AWS Managed Core Rule Set
+      {
+        name: 'AWS-AWSManagedRulesCommonRuleSet',
+        priority: 3,
+        overrideAction: {
+          none: {},
+        },
+        statement: {
+          managedRuleGroupStatement: {
+            vendorName: 'AWS',
+            name: 'AWSManagedRulesCommonRuleSet',
+          },
+        },
+        visibilityConfig: {
+          sampledRequestsEnabled: true,
+          cloudwatchMetricsEnabled: true,
+          metricName: 'AWSManagedRulesCommonRuleSetMetric',
+        },
+      },
+      // AWS Managed Known Bad Inputs Rule Set
+      {
+        name: 'AWS-AWSManagedRulesKnownBadInputsRuleSet',
+        priority: 4,
+        overrideAction: {
+          none: {},
+        },
+        statement: {
+          managedRuleGroupStatement: {
+            vendorName: 'AWS',
+            name: 'AWSManagedRulesKnownBadInputsRuleSet',
+          },
+        },
+        visibilityConfig: {
+          sampledRequestsEnabled: true,
+          cloudwatchMetricsEnabled: true,
+          metricName: 'AWSManagedRulesKnownBadInputsRuleSetMetric',
+        },
+      },
+      // SQL Injection Protection
+      {
+        name: 'AWS-AWSManagedRulesSQLiRuleSet',
+        priority: 5,
+        overrideAction: {
+          none: {},
+        },
+        statement: {
+          managedRuleGroupStatement: {
+            vendorName: 'AWS',
+            name: 'AWSManagedRulesSQLiRuleSet',
+          },
+        },
+        visibilityConfig: {
+          sampledRequestsEnabled: true,
+          cloudwatchMetricsEnabled: true,
+          metricName: 'AWSManagedRulesSQLiRuleSetMetric',
+        },
+      },
+    ]);
 
     // Create WAF WebACL
     const webAcl = new aws.wafv2.WebAcl(
@@ -324,95 +536,89 @@ export class IndexerApi extends pulumi.ComponentResource {
         defaultAction: {
           allow: {},
         },
-        rules: [
-          // Rate limiting rule
-          {
-            name: 'RateLimitRule',
-            priority: 1,
-            statement: {
-              rateBasedStatement: {
-                limit: 100, // 75 requests per 5 minutes per IP
-                aggregateKeyType: 'IP',
-                forwardedIpConfig: {
-                  headerName: 'CF-Connecting-IP',
-                  fallbackBehavior: 'MATCH',
-                },
-              },
-            },
-            action: {
-              block: {},
-            },
-            visibilityConfig: {
-              sampledRequestsEnabled: true,
-              cloudwatchMetricsEnabled: true,
-              metricName: 'RateLimitRule',
-            },
-          },
-          // AWS Managed Core Rule Set
-          {
-            name: 'AWS-AWSManagedRulesCommonRuleSet',
-            priority: 2,
-            overrideAction: {
-              none: {},
-            },
-            statement: {
-              managedRuleGroupStatement: {
-                vendorName: 'AWS',
-                name: 'AWSManagedRulesCommonRuleSet',
-              },
-            },
-            visibilityConfig: {
-              sampledRequestsEnabled: true,
-              cloudwatchMetricsEnabled: true,
-              metricName: 'AWSManagedRulesCommonRuleSetMetric',
-            },
-          },
-          // AWS Managed Known Bad Inputs Rule Set
-          {
-            name: 'AWS-AWSManagedRulesKnownBadInputsRuleSet',
-            priority: 3,
-            overrideAction: {
-              none: {},
-            },
-            statement: {
-              managedRuleGroupStatement: {
-                vendorName: 'AWS',
-                name: 'AWSManagedRulesKnownBadInputsRuleSet',
-              },
-            },
-            visibilityConfig: {
-              sampledRequestsEnabled: true,
-              cloudwatchMetricsEnabled: true,
-              metricName: 'AWSManagedRulesKnownBadInputsRuleSetMetric',
-            },
-          },
-          // SQL Injection Protection
-          {
-            name: 'AWS-AWSManagedRulesSQLiRuleSet',
-            priority: 4,
-            overrideAction: {
-              none: {},
-            },
-            statement: {
-              managedRuleGroupStatement: {
-                vendorName: 'AWS',
-                name: 'AWSManagedRulesSQLiRuleSet',
-              },
-            },
-            visibilityConfig: {
-              sampledRequestsEnabled: true,
-              cloudwatchMetricsEnabled: true,
-              metricName: 'AWSManagedRulesSQLiRuleSetMetric',
-            },
-          },
-        ],
+        rules: allRules,
         visibilityConfig: {
           sampledRequestsEnabled: true,
           cloudwatchMetricsEnabled: true,
           metricName: `${serviceName}-waf`,
         },
       },
-      { parent: this, provider: usEast1Provider }, // WAF for CloudFront must be in us-east-1
+      {
+        parent: this,
+        provider: usEast1Provider,
+        dependsOn: [allowedIpSet]
+      }, // WAF for CloudFront must be in us-east-1
+    );
+
+    // Cache policy for default behavior: short TTL (60s default, 300s max)
+    const shortCachePolicy = new aws.cloudfront.CachePolicy(
+      `${serviceName}-short-cache`,
+      {
+        name: `${serviceName}-short-cache`,
+        comment: 'Short cache for API responses (60s default)',
+        defaultTtl: 60,
+        minTtl: 0,
+        maxTtl: 300,
+        parametersInCacheKeyAndForwardedToOrigin: {
+          cookiesConfig: {
+            cookieBehavior: 'none',
+          },
+          headersConfig: {
+            headerBehavior: 'none',
+          },
+          queryStringsConfig: {
+            queryStringBehavior: 'all',
+          },
+          enableAcceptEncodingGzip: true,
+          enableAcceptEncodingBrotli: true,
+        },
+      },
+      { parent: this },
+    );
+
+    // Cache policy for epoch leaderboard: longer TTL (5m default, 1h max)
+    const epochLeaderboardCachePolicy = new aws.cloudfront.CachePolicy(
+      `${serviceName}-long-cache`,
+      {
+        name: `${serviceName}-long-cache`,
+        comment: 'Longer cache for historical epoch data (5m default)',
+        defaultTtl: 300,
+        minTtl: 60,
+        maxTtl: 3600,
+        parametersInCacheKeyAndForwardedToOrigin: {
+          cookiesConfig: {
+            cookieBehavior: 'none',
+          },
+          headersConfig: {
+            headerBehavior: 'none',
+          },
+          queryStringsConfig: {
+            queryStringBehavior: 'all',
+          },
+          enableAcceptEncodingGzip: true,
+          enableAcceptEncodingBrotli: true,
+        },
+      },
+      { parent: this },
+    );
+
+    // Origin request policy: forward all query strings to origin
+    const originRequestPolicy = new aws.cloudfront.OriginRequestPolicy(
+      `${serviceName}-origin-request`,
+      {
+        name: `${serviceName}-origin-request`,
+        comment: 'Forward all query strings to origin',
+        cookiesConfig: {
+          cookieBehavior: 'none',
+        },
+        headersConfig: {
+          headerBehavior: 'none',
+        },
+        queryStringsConfig: {
+          queryStringBehavior: 'all',
+        },
+      },
+      { parent: this },
     );
 
     // Parse API endpoint to get domain
@@ -465,19 +671,8 @@ export class IndexerApi extends pulumi.ComponentResource {
           allowedMethods: ['GET', 'HEAD', 'OPTIONS'],
           cachedMethods: ['GET', 'HEAD', 'OPTIONS'],
           compress: true,
-
-          // Cache policy for default behavior (current leaderboard)
-          defaultTtl: 60,    // 1 minute default
-          minTtl: 0,         // Allow immediate expiration
-          maxTtl: 300,       // Max 5 minutes
-
-          forwardedValues: {
-            queryString: true, // Forward query parameters for pagination
-            cookies: {
-              forward: 'none',
-            },
-            headers: [], // API Gateway doesn't need special headers
-          },
+          cachePolicyId: shortCachePolicy.id,
+          originRequestPolicyId: originRequestPolicy.id,
         },
 
         orderedCacheBehaviors: [
@@ -489,18 +684,8 @@ export class IndexerApi extends pulumi.ComponentResource {
             allowedMethods: ['GET', 'HEAD', 'OPTIONS'],
             cachedMethods: ['GET', 'HEAD', 'OPTIONS'],
             compress: true,
-
-            defaultTtl: 300,   // 5 minutes default
-            minTtl: 60,        // At least 1 minute
-            maxTtl: 3600,      // Max 1 hour
-
-            forwardedValues: {
-              queryString: true,
-              cookies: {
-                forward: 'none',
-              },
-              headers: [],
-            },
+            cachePolicyId: epochLeaderboardCachePolicy.id,
+            originRequestPolicyId: originRequestPolicy.id,
           },
         ],
 
@@ -514,20 +699,8 @@ export class IndexerApi extends pulumi.ComponentResource {
 
         customErrorResponses: [
           {
-            errorCode: 403,
-            responseCode: 403,
-            responsePagePath: '/error.html',
-            errorCachingMinTtl: 10,
-          },
-          {
-            errorCode: 404,
-            responseCode: 404,
-            responsePagePath: '/error.html',
-            errorCachingMinTtl: 10,
-          },
-          {
             errorCode: 500,
-            errorCachingMinTtl: 0, // Don't cache errors
+            errorCachingMinTtl: 0,
           },
           {
             errorCode: 502,

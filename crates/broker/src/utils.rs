@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -133,7 +133,7 @@ pub(crate) async fn estimate_gas_to_fulfill(
         .context("unsupported selector")?
     {
         ProofType::Any | ProofType::Inclusion => 0,
-        ProofType::Groth16 => groth16,
+        ProofType::Groth16 | ProofType::Blake3Groth16 => groth16,
         proof_type => {
             tracing::warn!("Unknown proof type in gas cost estimation: {proof_type:?}");
             0

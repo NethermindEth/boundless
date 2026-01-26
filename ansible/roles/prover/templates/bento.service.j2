@@ -1,0 +1,19 @@
+[Unit]
+Description=Bento Docker Service
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory={{ prover_dir }}
+EnvironmentFile={{ prover_env_file }}
+ExecStart=/usr/bin/docker {{ prover_docker_compose_invoke }} up
+ExecStop=/usr/bin/docker {{ prover_docker_compose_invoke }} down
+Restart=always
+RestartSec=10
+TimeoutStartSec=1800
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

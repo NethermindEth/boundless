@@ -73,6 +73,9 @@ jobs:
         with:
           toolchain: ${{ env.RISC0_TOOLCHAIN_VERSION }}
 
+      - name: Install protoc
+        uses: risc0/risc0/.github/actions/protoc@v3.0.3
+
       - name: Install cargo risczero
         uses: ./.github/actions/bininstall-risc0
         with:
@@ -90,9 +93,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Install protoc
-        run: sudo apt install protobuf-compiler -y
-
       - name: Build Bento Components Bundle
         working-directory: bento
         env:
@@ -100,7 +100,7 @@ jobs:
           CUDA_HOME: /usr/local/cuda
           PATH: /usr/local/cuda/bin:/usr/bin:/usr/local/bin:/home/runner/.cargo/bin:$PATH
           LD_LIBRARY_PATH: /usr/local/cuda/lib64:$LD_LIBRARY_PATH
-          NVCC_APPEND_FLAGS: "--generate-code arch=compute_75,code=sm_75 --generate-code arch=compute_86,code=sm_86 --generate-code arch=compute_89,code=sm_89 --generate-code arch=compute_120,code=sm_120"
+          NVCC_APPEND_FLAGS: "--generate-code arch=compute_75,code=sm_75 --generate-code arch=compute_80,code=sm_80 --generate-code arch=compute_86,code=sm_86 --generate-code arch=compute_89,code=sm_89 --generate-code arch=compute_120,code=sm_120"
           SCCACHE_CUDA: "1"
           SCCACHE_CUDA_COMPILER: "nvcc"
           SCCACHE_CUDA_INCLUDE: "/usr/local/cuda/include"

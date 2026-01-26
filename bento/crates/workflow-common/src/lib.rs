@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Use of this source code is governed by the Business Source License
 // as found in the LICENSE-BSL file.
@@ -27,6 +27,9 @@ pub const KECCAK_RECEIPT_PATH: &str = "keccak_receipts";
 /// join worker stream identifier
 pub const JOIN_WORK_TYPE: &str = "join";
 
+/// snark worker stream identifier
+pub const SNARK_WORK_TYPE: &str = "snark";
+
 pub const SNARK_RETRIES_DEFAULT: i32 = 3;
 pub const SNARK_TIMEOUT_DEFAULT: i32 = 60;
 
@@ -34,6 +37,7 @@ pub const SNARK_TIMEOUT_DEFAULT: i32 = 60;
 pub enum CompressType {
     None,
     Groth16,
+    Blake3Groth16,
 }
 
 impl Default for CompressType {

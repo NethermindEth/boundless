@@ -25,9 +25,9 @@ const environment: string = config.get("environment") || "custom";
 
 // Required base configuration
 const privateKey: pulumi.Output<string> = config.requireSecret("privateKey");
-const ethRpcUrl: pulumi.Output<string> = config.requireSecret("ethRpcUrl");
 const managerInstanceType: string = config.require("managerInstanceType");
-const orderStreamUrl: string = config.require("orderStreamUrl");
+const brokerRpcUrls: pulumi.Output<string> = pulumi.output(config.require("brokerRpcUrls"));
+const orderStreamUrl: pulumi.Output<string> = config.requireSecret("orderStreamUrl"); // Use secret to avoid exposing staging urls
 const verifierAddress: string = config.require("verifierAddress");
 const boundlessMarketAddress: string = config.require("boundlessMarketAddress");
 const setVerifierAddress: string = config.require("setVerifierAddress");
@@ -54,6 +54,7 @@ const maxCollateral: string = config.get("maxCollateral") || "200";
 const maxFileSize: string = config.get("maxFileSize") || "0";
 const maxMcycleLimit: string = config.get("maxMcycleLimit") || "0";
 const maxConcurrentProofs: number = config.getNumber("maxConcurrentProofs") || 1;
+const maxConcurrentPreflights: number = config.getNumber("maxConcurrentPreflights") || 3;
 const maxJournalBytes: number = config.getNumber("maxJournalBytes") || 1000000;
 const balanceWarnThreshold: string = config.get("balanceWarnThreshold") || "0";
 const balanceErrorThreshold: string = config.get("balanceErrorThreshold") || "0";
@@ -62,8 +63,11 @@ const collateralBalanceErrorThreshold: string = config.get("collateralBalanceErr
 const priorityRequestorAddresses: string = config.get("priorityRequestorAddresses") || "";
 const denyRequestorAddresses: string = config.get("denyRequestorAddresses") || "";
 const maxFetchRetries: number = config.getNumber("maxFetchRetries") || 3;
-const allowClientAddresses: string = config.get("allowClientAddresses") || "";
+const allowRequestorLists: string = config.get("allowRequestorLists") || "";
 const lockinPriorityGas: string = config.get("lockinPriorityGas") || "0";
+const orderCommitmentPriority: string = config.get("orderCommitmentPriority") || "cycle_price";
+
+const rustLogLevel: string = config.get("rustLogLevel") || "info,broker=debug,boundless_market=debug";
 
 // Look up the latest packer-built AMI
 const boundlessBentoVersion: string = config.get("boundlessBentoVersion") || "nightly";
@@ -118,7 +122,7 @@ const manager = new ManagerComponent({
     taskDBName,
     taskDBUsername,
     taskDBPassword,
-    ethRpcUrl,
+    brokerRpcUrls,
     privateKey,
     orderStreamUrl,
     verifierAddress,
@@ -140,6 +144,7 @@ const manager = new ManagerComponent({
     maxFileSize,
     maxMcycleLimit,
     maxConcurrentProofs,
+    maxConcurrentPreflights,
     maxJournalBytes,
     balanceWarnThreshold,
     balanceErrorThreshold,
@@ -148,8 +153,10 @@ const manager = new ManagerComponent({
     priorityRequestorAddresses,
     denyRequestorAddresses,
     maxFetchRetries,
-    allowClientAddresses,
+    allowRequestorLists,
     lockinPriorityGas,
+    orderCommitmentPriority,
+    rustLogLevel,
 });
 
 // Create worker clusters

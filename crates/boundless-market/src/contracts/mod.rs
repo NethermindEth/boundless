@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -566,9 +566,33 @@ impl Requirements {
     /// to the latest Groth16 selector.
     #[cfg(not(target_os = "zkvm"))]
     pub fn with_groth16_proof(self) -> Self {
+        use crate::selector::SelectorExt;
+
         match crate::util::is_dev_mode() {
-            true => Self { selector: FixedBytes::from(Selector::FakeReceipt as u32), ..self },
-            false => Self { selector: FixedBytes::from(Selector::groth16_latest() as u32), ..self },
+            true => Self { selector: FixedBytes::from(SelectorExt::FakeReceipt as u32), ..self },
+            false => {
+                Self { selector: FixedBytes::from(SelectorExt::groth16_latest() as u32), ..self }
+            }
+        }
+    }
+
+    /// Set the selector for a blake3 groth16 proof.
+    ///
+    /// This will set the selector to the appropriate value based on the current environment.
+    /// In dev mode, the selector will be set to `FakeBlake3Groth16`, otherwise it will be set
+    /// to the latest Blake3Groth16 selector.
+    #[cfg(not(target_os = "zkvm"))]
+    pub fn with_blake3_groth16_proof(self) -> Self {
+        use crate::selector::SelectorExt;
+
+        match crate::util::is_dev_mode() {
+            true => {
+                Self { selector: FixedBytes::from(SelectorExt::FakeBlake3Groth16 as u32), ..self }
+            }
+            false => Self {
+                selector: FixedBytes::from(SelectorExt::blake3_groth16_latest() as u32),
+                ..self
+            },
         }
     }
 }
@@ -957,6 +981,42 @@ impl Offer {
     pub fn with_lock_collateral_per_mcycle(self, mcycle_price: U256, mcycle: u64) -> Self {
         let lock_collateral = mcycle_price * U256::from(mcycle);
         Self { lockCollateral: lock_collateral, ..self }
+    }
+
+    /// Calculates the required performance (kHz) for the offer.
+    ///
+    /// The result is computed over the time period defined by the lock timeout.
+    /// Returns `f64::INFINITY` if `lockTimeout` is zero (invalid offer).
+    #[cfg(not(target_os = "zkvm"))]
+    pub fn required_khz_performance(&self, cycle_count: u64) -> f64 {
+        if self.lockTimeout == 0 {
+            tracing::warn!(
+                "lockTimeout is zero, cannot calculate required performance. Returning infinity."
+            );
+            return f64::INFINITY;
+        }
+        let frequency = cycle_count as f64 / (self.lockTimeout as f64);
+        // Convert to kHz
+        frequency / 1_000.0
+    }
+
+    /// Calculates the required performance (kHz) for the secondary prover.
+    ///
+    /// The result is computed over the time period defined by the timeout minus the lock timeout.
+    /// Returns `f64::INFINITY` if there is no secondary window (i.e., `timeout <= lockTimeout`),
+    /// indicating that a secondary prover cannot fulfill the request.
+    #[cfg(not(target_os = "zkvm"))]
+    pub fn required_khz_performance_secondary_prover(&self, cycle_count: u64) -> f64 {
+        let secondary_window = self.timeout.saturating_sub(self.lockTimeout);
+        if secondary_window == 0 {
+            tracing::warn!(
+                "No secondary window available (timeout <= lockTimeout). Secondary prover cannot fulfill request. Returning infinity."
+            );
+            return f64::INFINITY;
+        }
+        let frequency = cycle_count as f64 / (secondary_window as f64);
+        // Convert to kHz
+        frequency / 1_000.0
     }
 }
 

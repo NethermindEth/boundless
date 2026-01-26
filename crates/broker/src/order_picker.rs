@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ use crate::{
     db::DbObj,
     errors::CodedError,
     provers::{ProverError, ProverObj},
-    requestor_monitor::PriorityRequestors,
+    requestor_monitor::{AllowRequestors, PriorityRequestors},
     storage::{upload_image_uri, upload_input_uri},
     task::{RetryRes, RetryTask, SupervisorErr},
     utils, FulfillmentType, OrderRequest, OrderStateChange,
@@ -51,7 +51,7 @@ use boundless_market::{
         boundless_market::BoundlessMarketService, FulfillmentData, Predicate, PredicateType,
         RequestError, RequestInputType,
     },
-    selector::SupportedSelectors,
+    selector::{is_blake3_groth16_selector, SupportedSelectors},
 };
 use moka::future::Cache;
 use thiserror::Error;
@@ -180,6 +180,7 @@ pub struct OrderPicker<P> {
     preflight_cache: PreflightCache,
     order_state_tx: broadcast::Sender<OrderStateChange>,
     priority_requestors: PriorityRequestors,
+    allow_requestors: AllowRequestors,
 }
 
 #[derive(Debug)]
@@ -227,8 +228,9 @@ where
         collateral_token_decimals: u8,
         order_state_tx: broadcast::Sender<OrderStateChange>,
         priority_requestors: PriorityRequestors,
+        allow_requestors: AllowRequestors,
     ) -> Self {
-        let market = BoundlessMarketService::new(
+        let market = BoundlessMarketService::new_for_broker(
             market_addr,
             provider.clone(),
             provider.default_signer_address(),
@@ -259,6 +261,7 @@ where
             ),
             order_state_tx,
             priority_requestors,
+            allow_requestors,
         }
     }
 
@@ -384,11 +387,10 @@ where
             return Ok(Skip { reason: "order has expired".to_string() });
         };
 
-        let (min_deadline, allowed_addresses_opt, denied_addresses_opt, min_mcycle_limit) = {
+        let (min_deadline, denied_addresses_opt, min_mcycle_limit) = {
             let config = self.config.lock_all().context("Failed to read config")?;
             (
                 config.market.min_deadline,
-                config.market.allow_client_addresses.clone(),
                 config.market.deny_requestor_addresses.clone(),
                 config.market.min_mcycle_limit,
             )
@@ -404,18 +406,23 @@ where
             });
         }
 
-        // Initial sanity checks:
-        if let Some(allow_addresses) = allowed_addresses_opt {
-            let client_addr = order.request.client_address();
-            if !allow_addresses.contains(&client_addr) {
+        // Check if requestor is allowed (from both static config and dynamic lists)
+        let client_addr = order.request.client_address();
+        if !self.allow_requestors.is_allow_requestor(&client_addr) {
+            // Only skip if allow list is actually configured (either static or dynamic)
+            let has_allow_list = {
+                let config = self.config.lock_all().context("Failed to read config")?;
+                config.market.allow_client_addresses.is_some()
+                    || config.market.allow_requestor_lists.is_some()
+            };
+            if has_allow_list {
                 return Ok(Skip {
-                    reason: format!("order from {client_addr} is not in allowed addrs"),
+                    reason: format!("order from {client_addr} is not in allow requestors"),
                 });
             }
         }
 
         if let Some(deny_addresses) = denied_addresses_opt {
-            let client_addr = order.request.client_address();
             if deny_addresses.contains(&client_addr) {
                 return Ok(Skip {
                     reason: format!(
@@ -650,7 +657,7 @@ where
                             }
                             Err(err) => match err {
                                 ProverError::ProvingFailed(ref err_msg) => {
-                                    if err_msg.contains("Session limit exceeded") 
+                                    if err_msg.contains("Session limit exceeded")
                                         || err_msg.contains("Execution stopped intentionally due to session limit") {
                                         tracing::debug!(
                                             "Skipping order {order_id_clone} due to intentional execution limit of {exec_limit_cycles}",
@@ -735,13 +742,18 @@ where
             // provide the config value that needs to be updated in order to have accepted.
             let config_info = match &prove_limit_reason {
                 ProveLimitReason::EthPricing { max_price, gas_cost, mcycle_price_eth } => {
-                    let available_eth = max_price.saturating_sub(*gas_cost);
-                    let required_price_per_mcycle =
-                        available_eth.saturating_mul(ONE_MILLION) / U256::from(proof_cycles);
+                    let max_price_gas_adjusted = max_price.saturating_sub(*gas_cost);
+                    let required_price_per_mcycle = max_price_gas_adjusted
+                        .saturating_mul(ONE_MILLION)
+                        / U256::from(proof_cycles);
+                    let required_price_per_mcycle_ignore_gas =
+                        max_price.saturating_mul(ONE_MILLION) / U256::from(proof_cycles);
                     format!(
-                        "min_mcycle_price set to {} ETH/Mcycle in config, order requires min_mcycle_price <= {} ETH/Mcycle to be considered",
+                        "min_mcycle_price set to {} ETH/Mcycle in config, order requires min_mcycle_price <= {} ETH/Mcycle to be considered (gas cost: {} ETH, ignoring gas requires min {} ETH/Mcycle)",
                         format_ether(*mcycle_price_eth),
-                        format_ether(required_price_per_mcycle)
+                        format_ether(required_price_per_mcycle),
+                        format_ether(*gas_cost),
+                        format_ether(required_price_per_mcycle_ignore_gas)
                     )
                 }
                 ProveLimitReason::CollateralPricing { mcycle_price_collateral, .. } => {
@@ -821,13 +833,25 @@ where
             });
         }
 
+        // If the selector is a blake3 groth16 selector, ensure the journal is exactly 32 bytes
+        if is_blake3_groth16_selector(order.request.requirements.selector) && journal.len() != 32 {
+            tracing::info!(
+                "Order {order_id} journal is not 32 bytes for blake3 groth16 selector, skipping",
+            );
+            return Ok(Skip {
+                reason: "blake3 groth16 selector requires 32 byte journal".to_string(),
+            });
+        }
+
         // Validate the predicates:
         let predicate = Predicate::try_from(order.request.requirements.predicate.clone())
             .map_err(|e| OrderPickerErr::RequestError(Arc::new(e.into())))?;
-        let eval_data = FulfillmentData::from_image_id_and_journal(
-            Digest::from_hex(image_id).unwrap(),
-            journal,
-        );
+        let eval_data = if is_blake3_groth16_selector(order.request.requirements.selector) {
+            // These proofs must have no journal delivery because they cannot be authenticated on chain.
+            FulfillmentData::None
+        } else {
+            FulfillmentData::from_image_id_and_journal(Digest::from_hex(image_id).unwrap(), journal)
+        };
         if predicate.eval(&eval_data).is_none() {
             return Ok(Skip { reason: "order predicate check failed".to_string() });
         }
@@ -1544,10 +1568,13 @@ pub(crate) mod tests {
         signers::local::PrivateKeySigner,
     };
     use async_trait::async_trait;
-    use boundless_market::contracts::{
-        Callback, Offer, Predicate, ProofRequest, RequestId, RequestInput, Requirements,
-    };
     use boundless_market::storage::{MockStorageProvider, StorageProvider};
+    use boundless_market::{
+        contracts::{
+            Callback, Offer, Predicate, ProofRequest, RequestId, RequestInput, Requirements,
+        },
+        selector::SelectorExt,
+    };
     use boundless_test_utils::{
         guests::{ASSESSOR_GUEST_ID, ASSESSOR_GUEST_PATH, ECHO_ELF, ECHO_ID, LOOP_ELF, LOOP_ID},
         market::{deploy_boundless_market, deploy_hit_points},
@@ -1746,7 +1773,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-            let boundless_market = BoundlessMarketService::new(
+            let boundless_market = BoundlessMarketService::new_for_broker(
                 market_address,
                 provider.clone(),
                 provider.default_signer_address(),
@@ -1774,6 +1801,7 @@ pub(crate) mod tests {
 
             let chain_id = provider.get_chain_id().await.unwrap();
             let priority_requestors = PriorityRequestors::new(config.clone(), chain_id);
+            let allow_requestors = AllowRequestors::new(config.clone(), chain_id);
 
             const TEST_CHANNEL_CAPACITY: usize = 50;
             let (_new_order_tx, new_order_rx) = mpsc::channel(TEST_CHANNEL_CAPACITY);
@@ -1792,6 +1820,7 @@ pub(crate) mod tests {
                 self.collateral_token_decimals.unwrap_or(6),
                 order_state_tx,
                 priority_requestors,
+                allow_requestors,
             );
 
             PickerTestCtx {
@@ -1954,7 +1983,8 @@ pub(crate) mod tests {
             .await;
 
         // set a Groth16 selector
-        order.request.requirements.selector = FixedBytes::from(Selector::groth16_latest() as u32);
+        order.request.requirements.selector =
+            FixedBytes::from(SelectorExt::groth16_latest() as u32);
 
         let _request_id =
             ctx.boundless_market.submit_request(&order.request, &ctx.signer(0)).await.unwrap();
@@ -2109,7 +2139,7 @@ pub(crate) mod tests {
         let db_order = ctx.db.get_order(&order_id).await.unwrap().unwrap();
         assert_eq!(db_order.status, OrderStatus::Skipped);
 
-        assert!(logs_contain("is not in allowed addrs"));
+        assert!(logs_contain("is not in allow requestors"));
     }
 
     #[tokio::test]
@@ -2954,6 +2984,16 @@ pub(crate) mod tests {
             proof_id: &str,
         ) -> Result<Option<Vec<u8>>, ProverError> {
             self.default_prover.get_compressed_receipt(proof_id).await
+        }
+        async fn compress_blake3_groth16(&self, proof_id: &str) -> Result<String, ProverError> {
+            self.default_prover.compress_blake3_groth16(proof_id).await
+        }
+
+        async fn get_blake3_groth16_receipt(
+            &self,
+            proof_id: &str,
+        ) -> Result<Option<Vec<u8>>, ProverError> {
+            self.default_prover.get_blake3_groth16_receipt(proof_id).await
         }
     }
 

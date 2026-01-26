@@ -1,17 +1,20 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Use of this source code is governed by the Business Source License
 // as found in the LICENSE-BSL file.
 
 pragma solidity ^0.8.26;
 
-import {Script, console2} from "forge-std/Script.sol";
+import {console2} from "forge-std/Script.sol";
 import {Strings} from "openzeppelin/contracts/utils/Strings.sol";
 import {IRiscZeroSelectable} from "risc0/IRiscZeroSelectable.sol";
 import {IRiscZeroVerifier} from "risc0/IRiscZeroVerifier.sol";
 import {RiscZeroSetVerifier} from "risc0/RiscZeroSetVerifier.sol";
 import {RiscZeroVerifierRouter} from "risc0/RiscZeroVerifierRouter.sol";
 import {RiscZeroCheats} from "risc0/test/RiscZeroCheats.sol";
+import {RiscZeroMockVerifier} from "risc0/test/RiscZeroMockVerifier.sol";
+import {Blake3Groth16Verifier} from "../src/blake3-groth16/Blake3Groth16Verifier.sol";
+import {ControlID} from "../src/blake3-groth16/ControlID.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {ConfigLoader, DeploymentConfig} from "./Config.s.sol";
 import {BoundlessMarket} from "../src/BoundlessMarket.sol";
@@ -68,7 +71,15 @@ contract Deploy is BoundlessScriptBase, RiscZeroCheats {
             IRiscZeroSelectable selectable = IRiscZeroSelectable(address(_verifier));
             bytes4 selector = selectable.SELECTOR();
             verifierRouter.addVerifier(selector, _verifier);
+            console2.log("Added Groth16 verifier to router with selector");
+            console2.logBytes4(selector);
 
+            IRiscZeroVerifier _blake3G16Verifier = deployBlake3Verifier();
+            IRiscZeroSelectable blake3G16Selectable = IRiscZeroSelectable(address(_blake3G16Verifier));
+            bytes4 blake3G16Selector = blake3G16Selectable.SELECTOR();
+            verifierRouter.addVerifier(blake3G16Selector, _blake3G16Verifier);
+            console2.log("Added Blake3 Groth16 verifier to router with selector");
+            console2.logBytes4(blake3G16Selector);
             // TODO: Create a more robust way of getting a URI for guests, and ensure that it is
             // in-sync with the configured image ID.
             string memory setBuilderPath =
@@ -113,11 +124,13 @@ contract Deploy is BoundlessScriptBase, RiscZeroCheats {
             console2.log("Using application IRiscZeroVerifier deployed at", address(applicationVerifier));
         }
 
-        if (deploymentConfig.collateralToken == address(0)) {
+        bool deployedNewCollateralToken;
+        if (deploymentConfig.collateralToken == address(0) || deploymentConfig.collateralToken.code.length == 0) {
             // Deploy the HitPoints contract
             stakeToken = address(new HitPoints(boundlessMarketOwner));
             HitPoints(stakeToken).grantMinterRole(boundlessMarketOwner);
             console2.log("Deployed HitPoints collateral token to", stakeToken);
+            deployedNewCollateralToken = true;
         } else {
             stakeToken = deploymentConfig.collateralToken;
             console2.log("Using collateral token deployed at", stakeToken);
@@ -136,7 +149,7 @@ contract Deploy is BoundlessScriptBase, RiscZeroCheats {
         );
         console2.log("Deployed BoundlessMarket (proxy) to", boundlessMarketAddress);
 
-        if (deploymentConfig.collateralToken == address(0)) {
+        if (deployedNewCollateralToken) {
             HitPoints(stakeToken).grantAuthorizedTransferRole(boundlessMarketAddress);
             console2.log(
                 "Granted AUTHORIZED_TRANSFER role to BoundlessMarket on HitPoints collateral token", stakeToken
@@ -162,7 +175,7 @@ contract Deploy is BoundlessScriptBase, RiscZeroCheats {
         console2.log("Updated BoundlessMarket deployment commit: %s", currentCommit);
 
         // Also update collateral token if we deployed it
-        if (deploymentConfig.collateralToken == address(0)) {
+        if (deployedNewCollateralToken) {
             string[] memory tokenArgs = new string[](4);
             tokenArgs[0] = "python3";
             tokenArgs[1] = "contracts/update_deployment_toml.py";
@@ -174,5 +187,19 @@ contract Deploy is BoundlessScriptBase, RiscZeroCheats {
 
         // Check for uncommitted changes warning
         checkUncommittedChangesWarning("Deployment");
+    }
+
+    /// @notice Deploy either a test or fully verifying `Blake3Groth16Verifier` depending on `devMode()`.
+    function deployBlake3Verifier() internal returns (IRiscZeroVerifier) {
+        if (devMode()) {
+            // NOTE: Using a fixed selector of 0xFFFF0000 for the selector of the mock verifier.
+            IRiscZeroVerifier _verifier = new RiscZeroMockVerifier(bytes4(0xFFFF0000));
+            console2.log("Deployed RiscZeroMockVerifier to", address(_verifier));
+            return _verifier;
+        } else {
+            IRiscZeroVerifier _verifier = new Blake3Groth16Verifier(ControlID.CONTROL_ROOT, ControlID.BN254_CONTROL_ID);
+            console2.log("Deployed Blake3Groth16Verifier to", address(_verifier));
+            return _verifier;
+        }
     }
 }

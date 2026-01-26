@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,12 @@ use alloy::{
 };
 use anyhow::{Context, Result};
 use boundless_market::{
-    balance_alerts_layer::BalanceAlertConfig, client::Client, deployments::Deployment,
-    input::GuestEnv, request_builder::OfferParams, storage::fetch_url,
-    storage::StorageProviderConfig,
+    balance_alerts_layer::BalanceAlertConfig,
+    client::{Client, FundingMode},
+    deployments::Deployment,
+    input::GuestEnv,
+    request_builder::OfferParams,
+    storage::{fetch_url, StorageProviderConfig},
 };
 use clap::Parser;
 use rand::Rng;
@@ -178,6 +181,7 @@ async fn run(args: &MainArgs) -> Result<()> {
                 .min_price_per_cycle(args.min_price_per_mcycle >> 20)
                 .max_price_per_cycle(args.max_price_per_mcycle >> 20)
         })
+        .with_funding_mode(FundingMode::AvailableBalance)
         .build()
         .await?;
 
@@ -296,21 +300,31 @@ async fn handle_request(
         now + delay
     };
 
-    let request = client
-        .new_request()
-        .with_program(program.to_vec())
-        .with_program_url(program_url.clone())?
-        .with_env(env)
-        .with_cycles(input)
-        .with_journal(journal)
-        .with_offer(
-            OfferParams::builder()
-                .ramp_up_period(ramp_up)
-                .lock_timeout(lock_timeout)
-                .timeout(timeout)
-                .lock_collateral(args.lock_collateral_raw)
-                .bidding_start(bidding_start),
-        );
+    let request = match args.submit_offchain {
+        true => client
+            .new_request()
+            .with_program(program.to_vec())
+            .with_program_url(program_url.clone())?
+            .with_env(env)
+            .with_cycles(input)
+            .with_journal(journal)
+            .with_offer(
+                OfferParams::builder()
+                    .ramp_up_period(ramp_up)
+                    .lock_timeout(lock_timeout)
+                    .timeout(timeout)
+                    .lock_collateral(args.lock_collateral_raw)
+                    .bidding_start(bidding_start),
+            ),
+        // Onchain submission uses the default offer layer config.
+        false => client
+            .new_request()
+            .with_program(program.to_vec())
+            .with_program_url(program_url.clone())?
+            .with_env(env)
+            .with_cycles(input)
+            .with_journal(journal),
+    };
 
     // Build the request, including preflight, and assigned the remaining fields.
     let request = client.build_request(request).await?;

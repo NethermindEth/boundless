@@ -1,4 +1,4 @@
-// Copyright 2025 Boundless Foundation, Inc.
+// Copyright 2026 Boundless Foundation, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,6 +34,8 @@ use crate::{errors::CodedError, impl_coded_debug};
 
 mod defaults {
     use super::PriorityMode;
+
+    const ESTIMATED_GROTH16_TIME: u64 = 15;
 
     pub const fn max_journal_bytes() -> usize {
         10_000
@@ -103,6 +105,10 @@ mod defaults {
         ])
     }
 
+    pub fn allow_requestor_lists() -> Option<Vec<String>> {
+        None
+    }
+
     pub const fn max_mcycle_limit() -> u64 {
         8000
     }
@@ -112,7 +118,8 @@ mod defaults {
     }
 
     pub const fn min_deadline() -> u64 {
-        300
+        // Currently 150 seconds
+        block_deadline_buffer_secs() + 30
     }
 
     pub const fn lookback_blocks() -> u64 {
@@ -168,7 +175,8 @@ mod defaults {
     }
 
     pub const fn block_deadline_buffer_secs() -> u64 {
-        180
+        // Currently 120 seconds
+        txn_timeout() * max_submission_attempts() as u64 + ESTIMATED_GROTH16_TIME * 2
     }
 
     pub const fn txn_timeout() -> u64 {
@@ -307,6 +315,11 @@ pub struct MarketConf {
     ///
     /// If enabled, all requests from clients not in the allow list are skipped.
     pub allow_client_addresses: Option<Vec<Address>>,
+    /// Optional URLs to fetch requestor allow lists from.
+    ///
+    /// These lists will be periodically refreshed and merged with allow_client_addresses.
+    #[serde(default = "defaults::allow_requestor_lists")]
+    pub allow_requestor_lists: Option<Vec<String>>,
     /// Optional deny list for requestor address.
     ///
     /// If enabled, all requests from clients in the deny list are skipped.
@@ -436,6 +449,7 @@ impl Default for MarketConf {
             min_mcycle_limit: defaults::min_mcycle_limit(),
             priority_requestor_addresses: None,
             priority_requestor_lists: defaults::priority_requestor_lists(),
+            allow_requestor_lists: defaults::allow_requestor_lists(),
             max_journal_bytes: defaults::max_journal_bytes(),
             peak_prove_khz: None,
             min_deadline: defaults::min_deadline(),
