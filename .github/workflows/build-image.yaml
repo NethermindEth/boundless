@@ -22,7 +22,7 @@ jobs:
       rest_api: ${{ steps.filter.outputs.rest_api }}
       base: ${{ steps.filter.outputs.base }}
       cli: ${{ steps.filter.outputs.cli }}
-      boundless_version: "v1.2.0"
+      boundless_version: "v1.2.1"
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
