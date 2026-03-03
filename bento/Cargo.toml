@@ -18,7 +18,7 @@ repository = "https://github.com/boundless-xyz/boundless"
 
 [workspace.dependencies]
 anyhow = "1.0.98"
-aws-sdk-s3 = "1.34" # used for minio for max compatibility
+aws-sdk-s3 = "1.123" # used for minio for max compatibility
 bento-client = { path = "crates/bento-client" }
 bincode = "1.3.3"
 blake3_groth16 = { path = "../blake3_groth16", default-features = false }
