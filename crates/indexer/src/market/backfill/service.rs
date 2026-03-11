@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::db::market::IndexerDb;
-use crate::market::{
-    time_boundaries::{
-        get_day_start, get_hour_start, get_month_start, get_next_day, get_next_hour,
-        get_next_month, get_next_week, get_week_start,
+use crate::{
+    db::market::IndexerDb,
+    market::{
+        time_boundaries::{
+            get_day_start, get_hour_start, get_month_start, get_next_day, get_next_hour,
+            get_next_month, get_next_week, get_week_start,
+        },
+        IndexerService, ServiceError,
     },
-    IndexerService, ServiceError,
 };
-use alloy::network::{AnyNetwork, Ethereum};
-use alloy::primitives::B256;
-use alloy::providers::Provider;
+use alloy::{
+    network::{AnyNetwork, Ethereum},
+    primitives::B256,
+    providers::Provider,
+};
 use std::collections::HashSet;
+use std::time::Duration;
 
 const DIGEST_BATCH_SIZE: i64 = 5000;
 const STATUS_BATCH_SIZE: usize = 2500;
@@ -35,6 +40,7 @@ const DAILY_CHUNK_SIZE_DAYS: u64 = 7; // Process 1 week at a time
 const WEEKLY_CHUNK_SIZE_WEEKS: u64 = 2; // Process 2 weeks at a time
 const MONTHLY_CHUNK_SIZE_MONTHS: u64 = 2; // Process 2 months at a time
 const ALL_TIME_CHUNK_SIZE_HOURS: u64 = 48; // Process 2 days at a time (same as hourly)
+const EPOCH_CHUNK_SIZE_EPOCHS: u64 = 2; // Process 2 epochs at a time (4 days)
 
 /// Generic helper function to chunk a time range into smaller chunks
 /// Returns an iterator of (chunk_start, chunk_end) tuples where both are inclusive period boundaries
@@ -153,10 +159,46 @@ fn chunk_monthly_range(
     chunk_time_range(start_month, end_month, chunk_size_months, get_next_month)
 }
 
+/// Chunk epochs within a time range into smaller groups
+/// Returns an iterator of (chunk_start_time, chunk_end_time) tuples
+fn chunk_epoch_range(
+    epoch_calc: &crate::market::epoch_calculator::EpochCalculator,
+    start_ts: u64,
+    end_ts: u64,
+    chunk_size_epochs: u64,
+) -> impl Iterator<Item = (u64, u64)> {
+    let epoch0_start = epoch_calc.epoch0_start_time();
+
+    // Skip if entire range is before epoch 0
+    if end_ts < epoch0_start {
+        return Vec::new().into_iter();
+    }
+
+    let effective_start = start_ts.max(epoch0_start);
+    let start_epoch = epoch_calc.get_epoch_for_timestamp(effective_start).unwrap_or(0);
+    let end_epoch = epoch_calc.get_epoch_for_timestamp(end_ts).unwrap_or(start_epoch);
+
+    let mut chunks = Vec::new();
+    let mut current_epoch = start_epoch;
+
+    while current_epoch <= end_epoch {
+        let chunk_end_epoch = std::cmp::min(current_epoch + chunk_size_epochs - 1, end_epoch);
+
+        let chunk_start_time = epoch_calc.get_epoch_start_time(current_epoch);
+        let chunk_end_time = epoch_calc.get_epoch_end_time(chunk_end_epoch);
+
+        chunks.push((chunk_start_time, chunk_end_time));
+        current_epoch = chunk_end_epoch + 1;
+    }
+
+    chunks.into_iter()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum BackfillMode {
     StatusesAndAggregates,
     Aggregates,
+    ChainData,
 }
 
 pub struct BackfillService<P, ANP> {
@@ -164,6 +206,7 @@ pub struct BackfillService<P, ANP> {
     pub mode: BackfillMode,
     pub start_block: u64,
     pub end_block: u64,
+    pub chain_data_batch_delay_ms: u64,
 }
 
 impl<P, ANP> BackfillService<P, ANP>
@@ -176,8 +219,9 @@ where
         mode: BackfillMode,
         start_block: u64,
         end_block: u64,
+        chain_data_batch_delay_ms: u64,
     ) -> Self {
-        Self { indexer, mode, start_block, end_block }
+        Self { indexer, mode, start_block, end_block, chain_data_batch_delay_ms }
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
@@ -198,9 +242,124 @@ where
             BackfillMode::Aggregates => {
                 self.backfill_aggregates().await?;
             }
+            BackfillMode::ChainData => {
+                self.backfill_chain_data().await?;
+            }
         }
 
         tracing::info!("Backfill completed in {:?}", start_time.elapsed());
+        Ok(())
+    }
+
+    async fn backfill_chain_data(&mut self) -> Result<(), ServiceError> {
+        use std::cmp::min;
+
+        let start_time = std::time::Instant::now();
+        tracing::info!(
+            "Starting chain data backfill from block {} to {} (batch_size: {}, delay_ms: {})...",
+            self.start_block,
+            self.end_block,
+            self.indexer.config.batch_size,
+            self.chain_data_batch_delay_ms
+        );
+
+        let batch_size = self.indexer.config.batch_size;
+        let mut from_block = self.start_block;
+        let mut batch_num = 0;
+
+        // Calculate total number of batches for progress reporting
+        let total_blocks = self.end_block.saturating_sub(self.start_block) + 1;
+        let total_batches = total_blocks.div_ceil(batch_size);
+
+        while from_block <= self.end_block {
+            batch_num += 1;
+            let to_block = min(from_block + batch_size - 1, self.end_block);
+            let batch_start = std::time::Instant::now();
+
+            tracing::info!(
+                "=== Chain data backfill batch {}/{}: processing blocks {} to {} ===",
+                batch_num,
+                total_batches,
+                from_block,
+                to_block
+            );
+
+            // Fetch logs from RPC
+            let logs = self.indexer.fetch_logs(from_block, to_block).await?;
+            tracing::info!(
+                "Batch {}: fetched {} logs from blocks {} to {}",
+                batch_num,
+                logs.len(),
+                from_block,
+                to_block
+            );
+
+            // Apply rate limiting delay between batches if configured
+            if self.chain_data_batch_delay_ms > 0 {
+                tracing::info!(
+                    "Applying delay: {}ms before next batch",
+                    self.chain_data_batch_delay_ms
+                );
+                tokio::time::sleep(Duration::from_millis(self.chain_data_batch_delay_ms)).await;
+            }
+
+            if !logs.is_empty() {
+                // Fetch tx metadata for the logs
+                self.indexer.fetch_tx_metadata(&logs, from_block, to_block).await?;
+
+                // Process all events
+                let (submitted_digests, _offchain_digests) = tokio::try_join!(
+                    self.indexer.process_request_submitted_events(&logs),
+                    self.indexer.process_request_submitted_offchain(from_block, to_block)
+                )?;
+
+                let locked_digests = self.indexer.process_locked_events(&logs).await?;
+                let proof_delivered_digests =
+                    self.indexer.process_proof_delivered_events(&logs).await?;
+                let fulfilled_digests = self.indexer.process_fulfilled_events(&logs).await?;
+                let callback_failed_digests =
+                    self.indexer.process_callback_failed_events(&logs).await?;
+                let slashed_digests = self.indexer.process_slashed_events(&logs).await?;
+
+                // Process deposit/withdrawal events
+                tokio::try_join!(
+                    self.indexer.process_deposit_events(&logs),
+                    self.indexer.process_withdrawal_events(&logs),
+                    self.indexer.process_collateral_deposit_events(&logs),
+                    self.indexer.process_collateral_withdrawal_events(&logs)
+                )?;
+
+                let total_touched = submitted_digests.len()
+                    + locked_digests.len()
+                    + proof_delivered_digests.len()
+                    + fulfilled_digests.len()
+                    + callback_failed_digests.len()
+                    + slashed_digests.len();
+
+                tracing::info!(
+                    "Completed chain data backfill batch {}/{} [blocks {} to {}] : processed {} events, touched {} request digests in {:?}",
+                    batch_num, total_batches, from_block, to_block, logs.len(), total_touched, batch_start.elapsed()
+                );
+            } else {
+                tracing::info!(
+                    "Completed chain data backfill batch {}/{} [blocks {} to {}] : no logs found in blocks {} to {} ({:?})",
+                    batch_num, total_batches, from_block, to_block, from_block, to_block, batch_start.elapsed()
+                );
+            }
+
+            // Clear in-memory cache to free memory
+            self.indexer.clear_in_memory_cache();
+
+            from_block = to_block + 1;
+        }
+
+        tracing::info!(
+            "Chain data backfill completed: processed {} batches (blocks {} to {}) in {:?}",
+            batch_num,
+            self.start_block,
+            self.end_block,
+            start_time.elapsed()
+        );
         Ok(())
     }
 
@@ -268,10 +427,24 @@ where
                 let requests_comprehensive =
                     self.indexer.db.get_requests_comprehensive(&digest_set).await?;
 
+                // Fetch base fees for lock and fulfill blocks
+                let cost_blocks: std::collections::HashSet<u64> = requests_comprehensive
+                    .iter()
+                    .flat_map(|req| req.lock_block.into_iter().chain(req.fulfill_block))
+                    .collect();
+                let mut base_fee_map: std::collections::HashMap<u64, Option<u128>> =
+                    std::collections::HashMap::new();
+                for &block_num in &cost_blocks {
+                    let base_fee = self.indexer.db.get_block_base_fee(block_num).await?;
+                    base_fee_map.insert(block_num, base_fee);
+                }
+
                 // Compute statuses
                 let request_statuses: Vec<_> = requests_comprehensive
                     .into_iter()
-                    .map(|req| self.indexer.compute_request_status(req, current_timestamp))
+                    .map(|req| {
+                        self.indexer.compute_request_status(req, current_timestamp, &base_fee_map)
+                    })
                     .collect();
 
                 // Upsert statuses
@@ -354,6 +527,9 @@ where
 
         // Recompute all-time aggregates
         self.backfill_all_time_aggregates(start_timestamp, end_timestamp).await?;
+
+        // Recompute epoch aggregates
+        self.backfill_epoch_market_aggregates(start_timestamp, end_timestamp).await?;
 
         Ok(())
     }
@@ -615,6 +791,76 @@ where
         Ok(())
     }
 
+    async fn backfill_epoch_market_aggregates(
+        &mut self,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> Result<(), ServiceError> {
+        let epoch_calc = &self.indexer.epoch_calculator;
+
+        // Skip if entire range is before epoch 0
+        let epoch0_start = epoch_calc.epoch0_start_time();
+        if end_ts < epoch0_start {
+            tracing::info!(
+                "Skipping epoch market aggregates: end_ts {} is before epoch 0 start {}",
+                end_ts,
+                epoch0_start
+            );
+            return Ok(());
+        }
+
+        // Adjust start to epoch 0 start if needed
+        let effective_start = start_ts.max(epoch0_start);
+
+        let start_epoch = epoch_calc.get_epoch_for_timestamp(effective_start).unwrap_or(0);
+        let end_epoch = epoch_calc.get_epoch_for_timestamp(end_ts).unwrap_or(start_epoch);
+
+        if start_epoch > end_epoch {
+            tracing::info!(
+                "No epochs to process: start_epoch {} > end_epoch {}",
+                start_epoch,
+                end_epoch
+            );
+            return Ok(());
+        }
+
+        let total_epochs = end_epoch - start_epoch + 1;
+
+        // Calculate chunks
+        let chunks: Vec<_> =
+            chunk_epoch_range(epoch_calc, effective_start, end_ts, EPOCH_CHUNK_SIZE_EPOCHS)
+                .collect();
+
+        let total_chunks = chunks.len();
+
+        tracing::info!(
+            "Processing epoch market aggregates: {} epochs in {} chunks",
+            total_epochs,
+            total_chunks
+        );
+
+        for (chunk_idx, (chunk_start, chunk_end)) in chunks.iter().enumerate() {
+            let chunk_start_epoch = epoch_calc.get_epoch_for_timestamp(*chunk_start).unwrap_or(0);
+            let chunk_end_epoch = epoch_calc.get_epoch_for_timestamp(*chunk_end).unwrap_or(0);
+            let epoch_count = chunk_end_epoch - chunk_start_epoch + 1;
+
+            tracing::info!(
+                "Processing epoch market chunk {}/{}: epochs {} [{}] to {} [{}] ({} epochs)",
+                chunk_idx + 1,
+                total_chunks,
+                chunk_start_epoch,
+                *chunk_start,
+                chunk_end_epoch,
+                *chunk_end,
+                epoch_count
+            );
+
+            self.indexer.aggregate_epoch_market_data_from(*chunk_start, *chunk_end).await?;
+        }
+
+        Ok(())
+    }
+
     // Per-Requestor Backfill Methods
 
     async fn backfill_requestor_aggregates(
@@ -639,6 +885,9 @@ where
 
         // Recompute all-time aggregates
         self.backfill_all_time_requestor_aggregates(start_ts, end_ts).await?;
+
+        // Recompute epoch aggregates
+        self.backfill_epoch_requestor_aggregates(start_ts, end_ts).await?;
 
         tracing::info!("Per-requestor aggregate backfill completed in {:?}", start_time.elapsed());
         Ok(())
@@ -902,6 +1151,75 @@ where
         Ok(())
     }
 
+    async fn backfill_epoch_requestor_aggregates(
+        &mut self,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> Result<(), ServiceError> {
+        let epoch_calc = &self.indexer.epoch_calculator;
+
+        // Skip if entire range is before epoch 0
+        let epoch0_start = epoch_calc.epoch0_start_time();
+        if end_ts < epoch0_start {
+            tracing::info!(
+                "Skipping epoch requestor aggregates: end_ts {} is before epoch 0 start {}",
+                end_ts,
+                epoch0_start
+            );
+            return Ok(());
+        }
+
+        // Adjust start to epoch 0 start if needed
+        let effective_start = start_ts.max(epoch0_start);
+
+        let start_epoch = epoch_calc.get_epoch_for_timestamp(effective_start).unwrap_or(0);
+        let end_epoch = epoch_calc.get_epoch_for_timestamp(end_ts).unwrap_or(start_epoch);
+
+        if start_epoch > end_epoch {
+            tracing::info!(
+                "No epochs to process for requestors: start_epoch {} > end_epoch {}",
+                start_epoch,
+                end_epoch
+            );
+            return Ok(());
+        }
+
+        let total_epochs = end_epoch - start_epoch + 1;
+
+        // Calculate chunks
+        let chunks: Vec<_> =
+            chunk_epoch_range(epoch_calc, effective_start, end_ts, EPOCH_CHUNK_SIZE_EPOCHS)
+                .collect();
+
+        let total_chunks = chunks.len();
+
+        tracing::info!(
+            "Processing epoch requestor aggregates: {} epochs in {} chunks",
+            total_epochs,
+            total_chunks
+        );
+
+        for (chunk_idx, (chunk_start, chunk_end)) in chunks.iter().enumerate() {
+            // Timestamps here should be guaranteed to be on epoch boundaries by the chunking function
+            let chunk_start_epoch = epoch_calc.get_epoch_for_timestamp(*chunk_start).unwrap();
+            let chunk_end_epoch = epoch_calc.get_epoch_for_timestamp(*chunk_end).unwrap();
+            let epoch_count = chunk_end_epoch - chunk_start_epoch + 1;
+
+            tracing::info!(
+                "Processing epoch requestor chunk {}/{}: epochs {} to {} ({} epochs)",
+                chunk_idx + 1,
+                total_chunks,
+                chunk_start_epoch,
+                chunk_end_epoch,
+                epoch_count
+            );
+
+            self.indexer.aggregate_epoch_requestor_data_from(*chunk_start, *chunk_end).await?;
+        }
+
+        Ok(())
+    }
+
     async fn backfill_prover_aggregates(
         &mut self,
         start_ts: u64,
@@ -919,6 +1237,9 @@ where
         self.backfill_monthly_prover_aggregates(start_ts, end_ts).await?;
 
         self.backfill_all_time_prover_aggregates(start_ts, end_ts).await?;
+
+        // Recompute epoch aggregates
+        self.backfill_epoch_prover_aggregates(start_ts, end_ts).await?;
 
         tracing::info!("Per-prover aggregate backfill completed in {:?}", start_time.elapsed());
         Ok(())
@@ -1164,6 +1485,74 @@ where
 
         Ok(())
     }
+
+    async fn backfill_epoch_prover_aggregates(
+        &mut self,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> Result<(), ServiceError> {
+        let epoch_calc = &self.indexer.epoch_calculator;
+
+        // Skip if entire range is before epoch 0
+        let epoch0_start = epoch_calc.epoch0_start_time();
+        if end_ts < epoch0_start {
+            tracing::info!(
+                "Skipping epoch prover aggregates: end_ts {} is before epoch 0 start {}",
+                end_ts,
+                epoch0_start
+            );
+            return Ok(());
+        }
+
+        // Adjust start to epoch 0 start if needed
+        let effective_start = start_ts.max(epoch0_start);
+
+        let start_epoch = epoch_calc.get_epoch_for_timestamp(effective_start).unwrap_or(0);
+        let end_epoch = epoch_calc.get_epoch_for_timestamp(end_ts).unwrap_or(start_epoch);
+
+        if start_epoch > end_epoch {
+            tracing::info!(
+                "No epochs to process for provers: start_epoch {} > end_epoch {}",
+                start_epoch,
+                end_epoch
+            );
+            return Ok(());
+        }
+
+        let total_epochs = end_epoch - start_epoch + 1;
+
+        // Calculate chunks
+        let chunks: Vec<_> =
+            chunk_epoch_range(epoch_calc, effective_start, end_ts, EPOCH_CHUNK_SIZE_EPOCHS)
+                .collect();
+
+        let total_chunks = chunks.len();
+
+        tracing::info!(
+            "Processing epoch prover aggregates: {} epochs in {} chunks",
+            total_epochs,
+            total_chunks
+        );
+
+        for (chunk_idx, (chunk_start, chunk_end)) in chunks.iter().enumerate() {
+            let chunk_start_epoch = epoch_calc.get_epoch_for_timestamp(*chunk_start).unwrap_or(0);
+            let chunk_end_epoch = epoch_calc.get_epoch_for_timestamp(*chunk_end).unwrap_or(0);
+            let epoch_count = chunk_end_epoch - chunk_start_epoch + 1;
+
+            tracing::info!(
+                "Processing epoch prover chunk {}/{}: epochs {} to {} ({} epochs)",
+                chunk_idx + 1,
+                total_chunks,
+                chunk_start_epoch,
+                chunk_end_epoch,
+                epoch_count
+            );
+
+            self.indexer.aggregate_epoch_prover_data_from(*chunk_start, *chunk_end).await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1246,8 +1635,7 @@ mod tests {
 
     #[test]
     fn test_chunk_hourly_range_non_boundary_end() {
-        use crate::market::time_boundaries::get_hour_start;
-        use crate::market::time_boundaries::get_next_hour;
+        use crate::market::time_boundaries::{get_hour_start, get_next_hour};
 
         // Test: start=0 (aligned), end=9000 (30 minutes into hour 2)
         // The function should align end_ts to hour boundary

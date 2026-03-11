@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::chain_monitor::ChainHead;
-use crate::OrderRequest;
 use crate::{
-    chain_monitor::ChainMonitorService,
+    chain_monitor::{ChainHead, ChainMonitorService},
     config::{ConfigLock, OrderCommitmentPriority},
     db::DbObj,
     errors::CodedError,
     impl_coded_debug, now_timestamp,
     task::{RetryRes, RetryTask, SupervisorErr},
-    utils, FulfillmentType, Order,
+    utils, Erc1271GasCache, FulfillmentType, Order, OrderRequest,
 };
 use alloy::{
     network::Ethereum,
@@ -32,16 +30,21 @@ use alloy::{
     providers::{Provider, WalletProvider},
 };
 use anyhow::{Context, Result};
-use boundless_market::contracts::{
-    boundless_market::{BoundlessMarketService, MarketError},
-    IBoundlessMarket::IBoundlessMarketErrors,
-    RequestStatus, TxnErr,
+use boundless_market::{
+    contracts::{
+        boundless_market::{BoundlessMarketService, MarketError},
+        IBoundlessMarket::IBoundlessMarketErrors,
+        RequestStatus, TxnErr,
+    },
+    dynamic_gas_filler::PriorityMode,
+    selector::SupportedSelectors,
 };
-use boundless_market::dynamic_gas_filler::PriorityMode;
-use boundless_market::selector::SupportedSelectors;
+use moka::policy::EvictionPolicy;
 use moka::{future::Cache, Expiry};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -68,6 +71,10 @@ pub enum OrderMonitorErr {
 
     #[error("{code} Unexpected error: {0:?}", code = self.code())]
     UnexpectedError(#[from] anyhow::Error),
+
+    /// Pre-lock gas check failed (e.g. gas spike). Caller may retry next block.
+    #[error("{code} Pre-lock gas check failed (retry later): {0}", code = self.code())]
+    PreLockCheckRetry(String),
 }
 
 impl_coded_debug!(OrderMonitorErr);
@@ -80,6 +87,7 @@ impl CodedError for OrderMonitorErr {
             OrderMonitorErr::AlreadyLocked => "[B-OM-009]",
             OrderMonitorErr::InsufficientBalance => "[B-OM-010]",
             OrderMonitorErr::RpcErr(_) => "[B-OM-011]",
+            OrderMonitorErr::PreLockCheckRetry(_) => "[B-OM-012]",
             OrderMonitorErr::UnexpectedError(_) => "[B-OM-500]",
         }
     }
@@ -156,13 +164,15 @@ pub struct OrderMonitor<P> {
     lock_and_prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
     prove_cache: Arc<Cache<String, Arc<OrderRequest>>>,
     supported_selectors: SupportedSelectors,
+    erc1271_gas_cache: Erc1271GasCache,
     rpc_retry_config: RpcRetryConfig,
     gas_priority_mode: Arc<tokio::sync::RwLock<PriorityMode>>,
+    listen_only: bool,
 }
 
 impl<P> OrderMonitor<P>
 where
-    P: Provider<Ethereum> + WalletProvider,
+    P: Provider<Ethereum> + WalletProvider + 'static,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -177,6 +187,8 @@ where
         collateral_token_decimals: u8,
         rpc_retry_config: RpcRetryConfig,
         gas_priority_mode: Arc<tokio::sync::RwLock<PriorityMode>>,
+        erc1271_gas_cache: Erc1271GasCache,
+        listen_only: bool,
     ) -> Result<Self> {
         let txn_timeout_opt = {
             let config = config.lock_all().context("Failed to read config")?;
@@ -214,11 +226,23 @@ where
             provider,
             prover_addr,
             priced_order_rx: Arc::new(Mutex::new(priced_orders_rx)),
-            lock_and_prove_cache: Arc::new(Cache::builder().expire_after(OrderExpiry).build()),
-            prove_cache: Arc::new(Cache::builder().expire_after(OrderExpiry).build()),
+            lock_and_prove_cache: Arc::new(
+                Cache::builder()
+                    .eviction_policy(EvictionPolicy::lru())
+                    .expire_after(OrderExpiry)
+                    .build(),
+            ),
+            prove_cache: Arc::new(
+                Cache::builder()
+                    .eviction_policy(EvictionPolicy::lru())
+                    .expire_after(OrderExpiry)
+                    .build(),
+            ),
             supported_selectors: SupportedSelectors::default(),
+            erc1271_gas_cache,
             rpc_retry_config,
             gas_priority_mode,
+            listen_only,
         };
         Ok(monitor)
     }
@@ -264,6 +288,32 @@ where
             request_id,
             order.request.offer.lockCollateral
         );
+
+        // Pre-lock gas profitability check: compare gas cost against the order's current
+        // reward on the pricing ramp. Retries next block on failure (e.g. gas spike).
+        if let Some(gas_estimate) = order.gas_estimate {
+            let gas_price = self
+                .chain_monitor
+                .current_gas_price()
+                .await
+                .map_err(|e| OrderMonitorErr::PreLockCheckRetry(format!("gas price: {e:#}")))?;
+            let gas_cost = U256::from(gas_price) * U256::from(gas_estimate);
+            let reward = order
+                .request
+                .offer
+                .price_at(now_timestamp())
+                .map_err(|e| OrderMonitorErr::PreLockCheckRetry(e.to_string()))?;
+            if gas_cost > reward {
+                let msg = format!(
+                    "gas cost {} exceeds reward {}",
+                    format_ether(gas_cost),
+                    format_ether(reward)
+                );
+                tracing::warn!("Pre-lock check failed for request 0x{:x}: {msg}", request_id);
+                return Err(OrderMonitorErr::PreLockCheckRetry(msg));
+            }
+        }
+
         let lock_block =
             self.market.lock_request(&order.request, order.client_sig.clone()).await.map_err(
                 |e| -> OrderMonitorErr {
@@ -541,7 +591,14 @@ where
             async move {
                 let order_id = order.id();
                 if order.fulfillment_type == FulfillmentType::LockAndFulfill {
+                    if self.listen_only {
+                        tracing::info!("[LISTEN-ONLY] Would lock and prove order: {}", order_id);
+                        self.lock_and_prove_cache.invalidate(&order_id).await;
+                        return;
+                    }
+
                     let request_id = order.request.id;
+                    let mut should_invalidate = true;
                     match self.lock_order(order).await {
                         Ok(lock_price) => {
                             tracing::info!("Locked request: 0x{:x}", request_id);
@@ -554,33 +611,33 @@ where
                             }
                         }
                         Err(ref err) => {
-                            match err {
-                                OrderMonitorErr::UnexpectedError(inner) => {
-                                    tracing::error!(
-                                        "Failed to lock order: {order_id} - {} - {inner:?}",
-                                        err.code()
-                                    );
+                            if let OrderMonitorErr::PreLockCheckRetry(reason) = err {
+                                tracing::warn!("Pre-lock check failed for {order_id}: {reason}, will retry next block");
+                                should_invalidate = false;
+                            } else {
+                                if matches!(err, OrderMonitorErr::UnexpectedError(_)) {
+                                    tracing::error!("Failed to lock order: {order_id} - {err:?}");
+                                } else {
+                                    tracing::warn!("Failed to lock order: {order_id} - {err:?}");
                                 }
-                                OrderMonitorErr::AlreadyLocked => {
-                                    // For order already locked, we don't need to print the error backtrace.
-                                    tracing::warn!("Soft failed to lock request: {order_id} - {}", err.code());
+                                if let Err(e) = self.db.insert_skipped_request(order).await {
+                                    tracing::error!("Failed to set DB failure state for order: {order_id} - {e:?}");
                                 }
-                                _ => {
-                                    tracing::warn!(
-                                        "Soft failed to lock request: {order_id} - {} - {err:?}",
-                                        err.code()
-                                    );
-                                }
-                            }
-                            if let Err(err) = self.db.insert_skipped_request(order).await {
-                                tracing::error!(
-                                    "Failed to set DB failure state for order: {order_id} - {err:?}"
-                                );
                             }
                         }
                     }
-                    self.lock_and_prove_cache.invalidate(&order_id).await;
+                    if should_invalidate {
+                        self.lock_and_prove_cache.invalidate(&order_id).await;
+                    }
                 } else {
+                    if self.listen_only {
+                        tracing::info!(
+                            "[LISTEN-ONLY] Would prove order (after lock expire): {}",
+                            order_id
+                        );
+                        self.prove_cache.invalidate(&order_id).await;
+                        return;
+                    }
                     if let Err(err) = self.db.insert_accepted_request(order, U256::ZERO).await {
                         tracing::error!(
                             "Failed to set order status to pending proving: {} - {err:?}",
@@ -597,6 +654,16 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_insert_into_lock_cache(&self, order: Arc<OrderRequest>) {
+        self.lock_and_prove_cache.insert(order.id().clone(), order).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_lock_cache_contains(&self, order_id: &str) -> bool {
+        self.lock_and_prove_cache.get(order_id).await.is_some()
+    }
+
     /// Calculate the gas units needed for an order and the corresponding cost in wei
     async fn calculate_order_gas_cost_wei(
         &self,
@@ -605,22 +672,31 @@ where
     ) -> Result<U256, OrderMonitorErr> {
         // Calculate gas units needed for this order (lock + fulfill)
         let order_gas_units = if order.fulfillment_type == FulfillmentType::LockAndFulfill {
-            U256::from(utils::estimate_gas_to_lock(&self.config, order).await?).saturating_add(
-                U256::from(
-                    utils::estimate_gas_to_fulfill(
-                        &self.config,
-                        &self.supported_selectors,
-                        &order.request,
-                    )
-                    .await?,
-                ),
+            U256::from(
+                utils::estimate_gas_to_lock(
+                    &self.config,
+                    order,
+                    &self.provider,
+                    &self.erc1271_gas_cache,
+                )
+                .await?,
             )
+            .saturating_add(U256::from(
+                utils::estimate_gas_to_fulfill(
+                    &self.config,
+                    &self.supported_selectors,
+                    &order.request,
+                    order.journal_bytes,
+                )
+                .await?,
+            ))
         } else {
             U256::from(
                 utils::estimate_gas_to_fulfill(
                     &self.config,
                     &self.supported_selectors,
                     &order.request,
+                    order.journal_bytes,
                 )
                 .await?,
             )
@@ -656,11 +732,15 @@ where
         // Get current gas price and available balance
         let gas_price =
             self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
-        let available_balance_wei = self
-            .provider
-            .get_balance(self.provider.default_signer_address())
-            .await
-            .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?;
+        // In listen-only mode, skip balance checks since no transactions will be sent.
+        let available_balance_wei = if self.listen_only {
+            U256::MAX
+        } else {
+            self.provider
+                .get_balance(self.provider.default_signer_address())
+                .await
+                .map_err(|err| OrderMonitorErr::RpcErr(err.into()))?
+        };
 
         // Calculate gas units required for committed orders
         let committed_orders = self.db.get_committed_orders().await?;
@@ -670,6 +750,7 @@ where
                     &self.config,
                     &self.supported_selectors,
                     &order.request,
+                    order.journal_bytes,
                 )
             }))
             .await?
@@ -1011,13 +1092,11 @@ where
 pub(crate) mod tests {
     use super::*;
     use crate::OrderStatus;
-    use crate::{db::SqliteDb, now_timestamp, FulfillmentType};
-    use alloy::node_bindings::AnvilInstance;
-    use alloy::primitives::{address, Bytes};
+    use crate::{db::SqliteDb, now_timestamp, proving_order_from_request, FulfillmentType};
     use alloy::{
         network::EthereumWallet,
-        node_bindings::Anvil,
-        primitives::{Address, U256},
+        node_bindings::{Anvil, AnvilInstance},
+        primitives::{address, Address, Bytes, U256},
         providers::{
             fillers::{
                 BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
@@ -1056,7 +1135,6 @@ pub(crate) mod tests {
         pub anvil: AnvilInstance,
         pub db: DbObj,
         pub market_address: Address,
-        #[allow(dead_code)]
         pub config: ConfigLock,
         pub priced_order_tx: mpsc::Sender<Box<OrderRequest>>,
         pub signer: PrivateKeySigner,
@@ -1099,19 +1177,15 @@ pub(crate) mod tests {
                 .as_bytes()
                 .into();
 
-            Box::new(OrderRequest {
-                target_timestamp: Some(0),
+            let mut order = OrderRequest::new(
                 request,
-                image_id: None,
-                input_id: None,
-                expire_timestamp: None,
                 client_sig,
                 fulfillment_type,
-                boundless_market_address: self.market_address,
-                chain_id: self.anvil.chain_id(),
-                total_cycles: None,
-                cached_id: Default::default(),
-            })
+                self.market_address,
+                self.anvil.chain_id(),
+            );
+            order.target_timestamp = Some(0);
+            Box::new(order)
         }
     }
 
@@ -1166,7 +1240,9 @@ pub(crate) mod tests {
 
         let block_time = 2;
 
-        let chain_monitor = Arc::new(ChainMonitorService::new(provider.clone()).await.unwrap());
+        let gas_priority_mode = Arc::new(tokio::sync::RwLock::new(PriorityMode::default()));
+        let chain_monitor =
+            Arc::new(ChainMonitorService::new(provider.clone(), gas_priority_mode).await.unwrap());
         tokio::spawn(chain_monitor.spawn(Default::default()));
 
         // Create required channels for tests
@@ -1186,6 +1262,8 @@ pub(crate) mod tests {
             collateral_token_decimals,
             RpcRetryConfig { retry_count: 2, retry_sleep_ms: 500 },
             gas_priority_mode,
+            Arc::new(Cache::builder().build()),
+            false,
         )
         .unwrap();
 
@@ -1435,7 +1513,7 @@ pub(crate) mod tests {
         let committed_order = ctx
             .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
             .await;
-        let mut committed_order = committed_order.to_proving_order(Default::default());
+        let mut committed_order = proving_order_from_request(&committed_order, Default::default());
         committed_order.status = OrderStatus::Proving;
         committed_order.proving_started_at = Some(current_timestamp);
         ctx.db.add_order(&committed_order).await.unwrap();
@@ -1496,7 +1574,7 @@ pub(crate) mod tests {
         let committed_order = ctx
             .create_test_order(FulfillmentType::LockAndFulfill, current_timestamp, 100, 200)
             .await;
-        let mut committed_order = committed_order.to_proving_order(Default::default());
+        let mut committed_order = proving_order_from_request(&committed_order, Default::default());
         committed_order.status = OrderStatus::Proving;
         committed_order.total_cycles = Some(10_000_000_000_000_000);
         committed_order.proving_started_at = Some(current_timestamp);
@@ -1717,7 +1795,8 @@ pub(crate) mod tests {
                 .create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200)
                 .await;
 
-            let mut committed_order_obj = committed_order.to_proving_order(Default::default());
+            let mut committed_order_obj =
+                proving_order_from_request(&committed_order, Default::default());
             committed_order_obj.status = OrderStatus::Proving;
             committed_order_obj.proving_started_at = Some(now_timestamp());
             ctx.db.add_order(&committed_order_obj).await.unwrap();
@@ -1870,5 +1949,40 @@ pub(crate) mod tests {
             logs_contain("No longer have enough collateral deposited to market to lock order"),
             "Expected log message about insufficient collateral balance"
         );
+    }
+
+    /// Test that when gas cost exceeds the order's reward on the pricing ramp, the inline
+    /// pre-lock gas check keeps the order in cache for retry on the next block.
+    /// The test order's tiny maxPrice (2 wei) is far below Anvil's gas cost, so the check
+    /// naturally fails.
+    #[tokio::test]
+    #[traced_test]
+    async fn pre_lock_check_gas_too_high_keeps_order_in_cache() {
+        let mut ctx = setup_om_test_context().await;
+
+        // Use now_timestamp() for rampUpStart so expires_at() is in the future.
+        let mut order =
+            ctx.create_test_order(FulfillmentType::LockAndFulfill, now_timestamp(), 100, 200).await;
+        // Set gas_estimate so the inline pre-lock check fires.
+        // lockin_gas_estimate (200k) + fulfill_gas_estimate (300k) = 500k gas.
+        // At Anvil's default gas price (~1 gwei), cost = 500k * 1e9 = 5e14 wei,
+        // which far exceeds the order's reward of 2 wei.
+        order.gas_estimate = Some(500_000);
+        // Submit request on-chain so lock_order's get_status sees it as open (Unknown).
+        let _ = ctx.market_service.submit_request(&order.request, &ctx.signer).await.unwrap();
+        let order_arc = Arc::new(*order);
+        let order_id = order_arc.id().clone();
+        ctx.monitor.test_insert_into_lock_cache(order_arc.clone()).await;
+
+        let valid = ctx.monitor.get_valid_orders(1, 0).await.unwrap();
+        assert_eq!(valid.len(), 1, "expect single order from cache");
+        assert_eq!(valid[0].id(), order_id, "valid order must be the one we inserted");
+        ctx.monitor.lock_and_prove_orders(&valid).await.unwrap();
+
+        assert!(
+            ctx.monitor.test_lock_cache_contains(&order_id).await,
+            "When gas cost exceeds reward, order stays in cache and will retry next block"
+        );
+        assert!(logs_contain("gas cost"), "Expected log about gas cost exceeding reward");
     }
 }

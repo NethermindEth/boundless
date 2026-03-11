@@ -34,6 +34,7 @@ use boundless_indexer::{
 use boundless_market::contracts::{
     Offer, Predicate, ProofRequest, RequestId, RequestInput, Requirements,
 };
+use boundless_market::storage::StandardDownloader;
 use boundless_test_utils::{
     guests::{ECHO_ID, ECHO_PATH},
     market::{create_test_ctx, TestCtx},
@@ -64,7 +65,11 @@ pub async fn new_market_test_fixture(
     let anvil = Anvil::new().spawn();
     let ctx = create_test_ctx(&anvil).await?;
 
-    let client = boundless_market::Client::new(ctx.prover_market.clone(), ctx.set_verifier.clone());
+    let client = boundless_market::Client::new(
+        ctx.prover_market.clone(),
+        ctx.set_verifier.clone(),
+        StandardDownloader::new().await,
+    );
     let prover = OrderFulfiller::initialize(Arc::new(BrokerDefaultProver::default()), &client)
         .await
         .unwrap();
@@ -104,7 +109,7 @@ pub async fn create_isolated_db_pool(base_name: &str) -> (String, PgPool) {
 
 /// Extract the database connection string from a sqlx::test PgPool.
 /// sqlx::test creates an isolated database per test with a unique name.
-async fn get_db_url_from_pool(pool: &PgPool) -> String {
+pub async fn get_db_url_from_pool(pool: &PgPool) -> String {
     let base_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for sqlx::test");
     let db_name: String = sqlx::query_scalar("SELECT current_database()")
         .fetch_one(pool)
@@ -130,6 +135,7 @@ pub struct IndexerCliBuilder {
     batch_size: Option<String>,
     tx_fetch_strategy: Option<String>,
     order_stream_url: Option<String>,
+    epoch0_start_time: Option<String>,
 }
 
 impl IndexerCliBuilder {
@@ -145,6 +151,7 @@ impl IndexerCliBuilder {
             batch_size: None,
             tx_fetch_strategy: None,
             order_stream_url: None,
+            epoch0_start_time: None,
         }
     }
 
@@ -184,6 +191,12 @@ impl IndexerCliBuilder {
 
     pub fn order_stream_url(mut self, url: &str) -> Self {
         self.order_stream_url = Some(url.to_string());
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn epoch0_start_time(mut self, epoch0_start_time: u64) -> Self {
+        self.epoch0_start_time = Some(epoch0_start_time.to_string());
         self
     }
 
@@ -229,6 +242,11 @@ impl IndexerCliBuilder {
         if let Some(url) = self.order_stream_url {
             args.push("--order-stream-url".to_string());
             args.push(url);
+        }
+
+        if let Some(epoch0) = self.epoch0_start_time {
+            args.push("--epoch0-start-time".to_string());
+            args.push(epoch0);
         }
 
         println!("{} {:?}", exe_path, args);
@@ -886,6 +904,8 @@ pub async fn get_all_time_summaries(
             locked_orders_fulfillment_rate,
             total_program_cycles,
             total_cycles,
+            total_fixed_cost,
+            total_variable_cost,
             best_peak_prove_mhz_prover,
             best_peak_prove_mhz_request_id,
             best_effective_prove_mhz_prover,
@@ -902,6 +922,11 @@ pub async fn get_all_time_summaries(
     rows.into_iter()
         .map(|row| AllTimeMarketSummary {
             period_timestamp: row.get::<i64, _>("period_timestamp") as u64,
+            epoch_number_period_start: row
+                .try_get::<Option<i64>, _>("epoch_number_period_start")
+                .ok()
+                .flatten()
+                .unwrap_or(0),
             total_fulfilled: row.get::<i64, _>("total_fulfilled") as u64,
             unique_provers_locking_requests: row.get::<i64, _>("unique_provers_locking_requests")
                 as u64,
@@ -929,6 +954,8 @@ pub async fn get_all_time_summaries(
                 as f32,
             total_program_cycles: parse_u256(&row.get::<String, _>("total_program_cycles")),
             total_cycles: parse_u256(&row.get::<String, _>("total_cycles")),
+            total_fixed_cost: parse_u256(&row.get::<String, _>("total_fixed_cost")),
+            total_variable_cost: parse_u256(&row.get::<String, _>("total_variable_cost")),
             best_peak_prove_mhz: row.get::<f64, _>("best_peak_prove_mhz_v2"),
             best_peak_prove_mhz_prover: row.try_get("best_peak_prove_mhz_prover").ok(),
             best_peak_prove_mhz_request_id: row

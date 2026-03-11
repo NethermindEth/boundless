@@ -1,4 +1,110 @@
-# Market Indexer
+# Indexer Infrastructure
+
+This directory contains the Pulumi infrastructure-as-code for deploying the Boundless indexers to AWS.
+
+## AWS Architecture
+
+The indexer infrastructure runs on AWS with the following components:
+
+```
+                                      +------------------+
+                                      |   RPC Providers  |
+                                      |  (Alchemy, etc.) |
+                                      +--------+---------+
+                                               |
+            +----------------------------------+----------------------------------+
+            |                                                                     |
+            v                                                                     v
++------------------------+                                             +------------------------+
+|  ECS Fargate Service   |                                             |  ECS Fargate Task      |
+|  (long-running)        |                                             |  (on-demand)           |
+|                        |                                             |                        |
+|  +------------------+  |                                             |  +------------------+  |
+|  | Market Indexer   |  |                                             |  | Backfill Task    |  |
+|  +------------------+  |                                             |  +------------------+  |
++----------+-------------+                                             +----------+-------------+
+           |                                                                      ^
+           |                                                                      |
+           |    +------------------------------------------+                      |
+           |    |           Aurora PostgreSQL              |                      |
+           |    |                                          |                      |
+           +--->|  +----------------+  +----------------+  |<---------------------+
+                |  | Writer         |  | Reader         |  |
+                |  | Instance       |  | Instance       |  |
+                |  | (db.r6g.xlarge)|  | (db.r6g.xlarge)|  |
+                |  +-------+--------+  +--------+-------+  |
+                |          |                    |          |
+                |     writes only          reads only      |
+                +------------------------------------------+
+                                                |
+                                                v
++-----------------------------------------------------------------------------------+
+|                                    AWS VPC                                        |
++-----------------------------------------------------------------------------------+
+
+=== API Layer ===
+
++---------------------+      +----------------------+      +------------------+
+|   Frontend Apps     |----->|  API Gateway +       |----->|  Indexer API     |
+|                     |      |  CloudFront          |      |  (Lambda)        |
++---------------------+      +----------------------+      +--------+---------+
+                                                                    |
+                                                                    | reads from
+                                                                    v
+                                                           Aurora Reader Instance
+
+=== Operations / Backfill ===
+
++-------------------------+      +----------------------+      +------------------+
+|     EventBridge         |----->|  Backfill Trigger    |----->| Backfill Task    |
+|  (scheduled triggers)   |      |  (Lambda)            |      | (ECS Fargate)    |
+|                         |      +----------------------+      +------------------+
+|  - Daily aggregates     |                                           |
+|    backfill (2 AM UTC)  |                                           | writes to
+|  - Daily chain data     |                                           v
+|    backfill (6 PM UTC)  |                                   Aurora Writer Instance
++-------------------------+
+
+=== Supporting Services ===
+
++---------------------------+     +------------------------------------------+
+|          ECR              |     |              S3 Bucket                   |
+|   (container registry)    |     |   (cache for logs/tx metadata)          |
++---------------------------+     +------------------------------------------+
+```
+
+### Data Flow
+
+**Indexing**
+
+The Market Indexer runs as a long-running ECS Fargate service. It continuously fetches blockchain events from RPC providers (e.g., Alchemy, QuikNode), processes them, and writes to the Aurora PostgreSQL writer instance. The indexer tracks its progress via the `last_block` table and can be configured to lag behind chain head to reduce reorg risk.
+
+**API Reads**
+
+The Indexer API Lambda serves read requests from frontend applications. It connects to the Aurora PostgreSQL reader instance to avoid impacting write performance on the writer. CloudFront sits in front of API Gateway to provide:
+
+- Edge caching for frequently accessed data (reduces Lambda invocations and database load)
+- Geographic distribution for lower latency
+- Rate limiting via WAF to protect against abuse
+
+**Backfills**
+
+Backfills reprocess historical data to fix inconsistencies or rebuild computed tables. They run as on-demand ECS Fargate tasks triggered by Lambda functions.
+
+**Scheduled Backfills**:
+
+| Schedule          | Mode                      | Purpose                                                                                  |
+| ----------------- | ------------------------- | ---------------------------------------------------------------------------------------- |
+| Daily at 2 AM UTC | `statuses_and_aggregates` | Recomputes all request statuses and regenerates aggregation tables                       |
+| Daily at 6 PM UTC | `chain_data`              | Re-fetches recent blockchain events (default: last 100k blocks) to catch any missed data |
+
+**Backfill Modes**:
+
+- **`chain_data`**: Re-fetches and processes raw blockchain events from RPC. Used to backfill missing events or re-index after schema changes that affect event storage. Processes in batches with configurable delay to avoid RPC rate limits.
+
+- **`statuses_and_aggregates`**: Iterates through all request digests and recomputes their status from the stored event data, then regenerates all aggregation tables. Used when status computation logic changes or to fix data inconsistencies.
+
+- **`aggregates`**: Regenerates only the aggregation tables (market, requestor, prover summaries) without touching request statuses. Used when aggregation logic changes or to rebuild summaries after manual data fixes.
 
 ## Development on AWS
 
@@ -73,6 +179,15 @@ aws lambda list-functions --query 'Functions[?contains(FunctionName, `backfill-t
   --end-block 39383104
 ```
 
+or chain_data mode with lookback blocks:
+
+```bash
+./scripts/trigger-backfill.sh \
+  --lambda-name <from above> \
+  --mode chain_data \
+  --lookback-blocks 1000
+```
+
 ### (Backup, prefer script) Direct Lambda Invocation
 
 ```bash
@@ -87,13 +202,15 @@ aws lambda invoke \
 
 **Required:**
 
-- `mode`: "statuses_and_aggregates" or "aggregates"
-- `startBlock`: Starting block number
+- `mode`: "statuses_and_aggregates", "aggregates", or "chain_data"
+- `startBlock` OR `lookbackBlocks`: Starting block number OR number of blocks to look back from current
 
 **Optional:**
 
 - `endBlock`: Ending block number (default: latest indexed)
 - `txFetchStrategy`: "block-receipts" or "tx-by-hash" (default: "tx-by-hash")
+
+**Note:** You must provide either `startBlock` or `lookbackBlocks`, but not both. The `lookbackBlocks` parameter is useful when you want to backfill a fixed number of blocks from the current chain head.
 
 ## Development
 
@@ -105,3 +222,24 @@ npm run build
 cd ..
 pulumi up
 ```
+
+# Redrive Lambda (manual redrive of failed cycle counts)
+
+The market indexer runs cycle-count execution (Bento) for requests. Rows in `cycle_counts` move through `PENDING` -> `EXECUTING` -> `COMPLETED` or `FAILED`. Failed rows are not retried automatically. The **redrive Lambda** lets you reset `FAILED` (and optionally stuck `EXECUTING`) rows back to `PENDING` so the indexer picks them up again on its next run.
+
+The Lambda runs inside the VPC with writer DB access. It is invoked manually (no schedule).
+
+Use `./scripts/trigger-redrive.sh` to invoke the Lambda. Get the lambda name from the AWS console (Lambda > Functions) or via CLI:
+
+```bash
+aws lambda list-functions --query 'Functions[?contains(FunctionName, `redrive`)].FunctionName' --output text
+```
+
+```bash
+./scripts/trigger-redrive.sh --lambda-name <name> --lookback-days 3 --dry-run
+./scripts/trigger-redrive.sh --lambda-name <name> --lookback-days 3
+./scripts/trigger-redrive.sh --lambda-name <name> --lookback-days 7 --include-stuck
+./scripts/trigger-redrive.sh --lambda-name <name> --lookback-days 3 --requestor 0xABC...
+```
+
+Run `./scripts/trigger-redrive.sh --help` for all options.

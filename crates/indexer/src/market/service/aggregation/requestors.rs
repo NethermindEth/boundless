@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::super::{
-    IndexerService, DAILY_AGGREGATION_RECOMPUTE_DAYS, HOURLY_AGGREGATION_RECOMPUTE_HOURS,
-    MONTHLY_AGGREGATION_RECOMPUTE_MONTHS, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_WEEK,
-    WEEKLY_AGGREGATION_RECOMPUTE_WEEKS,
+    DbResultExt, IndexerService, DAILY_AGGREGATION_RECOMPUTE_DAYS,
+    HOURLY_AGGREGATION_RECOMPUTE_HOURS, MONTHLY_AGGREGATION_RECOMPUTE_MONTHS, SECONDS_PER_DAY,
+    SECONDS_PER_HOUR, SECONDS_PER_WEEK, WEEKLY_AGGREGATION_RECOMPUTE_WEEKS,
 };
+use super::epochs::EPOCH_AGGREGATION_RECOMPUTE_COUNT;
 use crate::db::RequestorDb;
 use crate::market::{
     pricing::compute_percentiles,
@@ -115,7 +116,11 @@ where
                             let summary = service
                                 .compute_period_requestor_summary(hour_ts, hour_end, requestor)
                                 .await?;
-                            service.db.upsert_hourly_requestor_summary(summary).await?;
+                            service
+                                .db
+                                .upsert_hourly_requestor_summary(summary)
+                                .await
+                                .with_db_context("upsert_hourly_requestor_summary")?;
                         }
                         Ok::<(), ServiceError>(())
                     }
@@ -198,7 +203,11 @@ where
                             let summary = service
                                 .compute_period_requestor_summary(day_ts, day_end, requestor)
                                 .await?;
-                            service.db.upsert_daily_requestor_summary(summary).await?;
+                            service
+                                .db
+                                .upsert_daily_requestor_summary(summary)
+                                .await
+                                .with_db_context("upsert_daily_requestor_summary")?;
                         }
                         Ok::<(), ServiceError>(())
                     }
@@ -281,7 +290,11 @@ where
                             let summary = service
                                 .compute_period_requestor_summary(week_ts, week_end, requestor)
                                 .await?;
-                            service.db.upsert_weekly_requestor_summary(summary).await?;
+                            service
+                                .db
+                                .upsert_weekly_requestor_summary(summary)
+                                .await
+                                .with_db_context("upsert_weekly_requestor_summary")?;
                         }
                         Ok::<(), ServiceError>(())
                     }
@@ -385,7 +398,11 @@ where
                             let summary = service
                                 .compute_period_requestor_summary(month_ts, month_end, requestor)
                                 .await?;
-                            service.db.upsert_monthly_requestor_summary(summary).await?;
+                            service
+                                .db
+                                .upsert_monthly_requestor_summary(summary)
+                                .await
+                                .with_db_context("upsert_monthly_requestor_summary")?;
                         }
                         Ok::<(), ServiceError>(())
                     }
@@ -502,6 +519,10 @@ where
                                 tracing::debug!("No previous all-time requestor aggregate for {:?}, initializing with zeros", requestor);
                                 crate::db::market::AllTimeRequestorSummary {
                                     period_timestamp: base_timestamp,
+                                    epoch_number_period_start: self
+                                        .epoch_calculator
+                                        .get_epoch_for_timestamp(base_timestamp)
+                                        .unwrap_or(0) as i64,
                                     requestor_address: requestor,
                                     total_fulfilled: 0,
                                     unique_provers_locking_requests: 0,
@@ -521,6 +542,8 @@ where
                                     locked_orders_fulfillment_rate_adjusted: 0.0,
                                     total_program_cycles: alloy::primitives::U256::ZERO,
                                     total_cycles: alloy::primitives::U256::ZERO,
+                                    total_fixed_cost: alloy::primitives::U256::ZERO,
+                                    total_variable_cost: alloy::primitives::U256::ZERO,
                                     best_peak_prove_mhz: 0.0,
                                     best_peak_prove_mhz_prover: None,
                                     best_peak_prove_mhz_request_id: None,
@@ -551,6 +574,8 @@ where
                                 cumulative_summary.total_fees_locked += summary.total_fees_locked;
                                 cumulative_summary.total_collateral_locked += summary.total_collateral_locked;
                                 cumulative_summary.total_locked_and_expired_collateral += summary.total_locked_and_expired_collateral;
+                                cumulative_summary.total_fixed_cost += summary.total_fixed_cost;
+                                cumulative_summary.total_variable_cost += summary.total_variable_cost;
 
                                 // Update best metrics
                                 if summary.best_peak_prove_mhz > cumulative_summary.best_peak_prove_mhz {
@@ -569,6 +594,10 @@ where
                             }
 
                             cumulative_summary.period_timestamp = hour_ts;
+                            cumulative_summary.epoch_number_period_start = self
+                                .epoch_calculator
+                                .get_epoch_for_timestamp(hour_ts)
+                                .unwrap_or(0) as i64;
 
                             // Query unique provers for this requestor up to this hour
                             cumulative_summary.unique_provers_locking_requests = service.db
@@ -583,22 +612,29 @@ where
                                 0.0
                             };
 
-                            // Query adjusted counts and recalculate adjusted fulfillment rate
-                            let adjusted_fulfilled = service.db
-                                .get_all_time_requestor_locked_and_fulfilled_count_adjusted(hour_ts + 1, requestor)
-                                .await?;
-                            let adjusted_expired = service.db
-                                .get_all_time_requestor_locked_and_expired_count_adjusted(hour_ts + 1, requestor)
-                                .await?;
-                            let total_locked_outcomes_adjusted = adjusted_fulfilled + adjusted_expired;
-                            cumulative_summary.locked_orders_fulfillment_rate_adjusted = if total_locked_outcomes_adjusted > 0 {
-                                (adjusted_fulfilled as f32 / total_locked_outcomes_adjusted as f32) * 100.0
-                            } else {
-                                0.0
-                            };
+                            // TODO: Query adjusted counts and recalculate adjusted fulfillment rate
+                            // These queries are too slow (6+ seconds) due to COUNT(DISTINCT) over large dataset.
+                            // Temporarily disabled.
+                            // let adjusted_fulfilled = service.db
+                            //     .get_all_time_requestor_locked_and_fulfilled_count_adjusted(hour_ts + 1, requestor)
+                            //     .await?;
+                            // let adjusted_expired = service.db
+                            //     .get_all_time_requestor_locked_and_expired_count_adjusted(hour_ts + 1, requestor)
+                            //     .await?;
+                            // let total_locked_outcomes_adjusted = adjusted_fulfilled + adjusted_expired;
+                            // cumulative_summary.locked_orders_fulfillment_rate_adjusted = if total_locked_outcomes_adjusted > 0 {
+                            //     (adjusted_fulfilled as f32 / total_locked_outcomes_adjusted as f32) * 100.0
+                            // } else {
+                            //     0.0
+                            // };
+                            cumulative_summary.locked_orders_fulfillment_rate_adjusted = 0.0;
 
                             // ALWAYS save the all-time requestor aggregate, even if there was no activity
-                            service.db.upsert_all_time_requestor_summary(cumulative_summary.clone()).await?;
+                            service
+                                .db
+                                .upsert_all_time_requestor_summary(cumulative_summary.clone())
+                                .await
+                                .with_db_context("upsert_all_time_requestor_summary")?;
                         }
                         Ok::<(), ServiceError>(())
                     }
@@ -621,7 +657,7 @@ where
     ) -> Result<crate::db::market::PeriodRequestorSummary, ServiceError> {
         use crate::db::market::PeriodRequestorSummary;
 
-        // Execute all database queries in parallel
+        // Execute database queries in 3 sequential batches to parallelize without overloading the database
         let (
             total_fulfilled,
             unique_provers,
@@ -629,17 +665,6 @@ where
             total_requests_submitted_onchain,
             total_requests_locked,
             total_requests_slashed,
-            total_expired,
-            total_locked_and_expired,
-            total_locked_and_fulfilled,
-            total_secondary_fulfillments,
-            total_locked_and_fulfilled_adjusted,
-            total_locked_and_expired_adjusted,
-            locks,
-            all_lock_collaterals,
-            locked_and_expired_collaterals,
-            total_program_cycles,
-            total_cycles,
         ) = tokio::join!(
             self.db.get_period_requestor_fulfilled_count(
                 period_start,
@@ -671,6 +696,16 @@ where
                 period_end,
                 requestor_address
             ),
+        );
+
+        let (
+            total_expired,
+            total_locked_and_expired,
+            total_locked_and_fulfilled,
+            total_secondary_fulfillments,
+            total_locked_and_fulfilled_adjusted,
+            total_locked_and_expired_adjusted,
+        ) = tokio::join!(
             self.db.get_period_requestor_expired_count(period_start, period_end, requestor_address),
             self.db.get_period_requestor_locked_and_expired_count(
                 period_start,
@@ -697,6 +732,15 @@ where
                 period_end,
                 requestor_address
             ),
+        );
+
+        let (
+            locks,
+            all_lock_collaterals,
+            locked_and_expired_collaterals,
+            total_program_cycles,
+            total_cycles,
+        ) = tokio::join!(
             self.db.get_period_requestor_lock_pricing_data(
                 period_start,
                 period_end,
@@ -761,6 +805,7 @@ where
         };
 
         let mut total_fees = alloy::primitives::U256::ZERO;
+        let mut total_fixed_cost = alloy::primitives::U256::ZERO;
         let mut prices_per_cycle: Vec<alloy::primitives::Uint<256, 4>> = Vec::new();
 
         for lock in locks {
@@ -799,6 +844,12 @@ where
 
             total_fees += price;
 
+            if let Some(fixed_cost_str) = &lock.fixed_cost {
+                if let Ok(fc) = alloy::primitives::U256::from_str(fixed_cost_str) {
+                    total_fixed_cost += fc;
+                }
+            }
+
             if let Some(price_per_cycle_str) = &lock.lock_price_per_cycle {
                 if let Ok(price_per_cycle) = alloy::primitives::U256::from_str(price_per_cycle_str)
                 {
@@ -825,6 +876,12 @@ where
             total_locked_and_expired_collateral += lock_collateral;
         }
 
+        let total_variable_cost = if total_fees > total_fixed_cost {
+            total_fees - total_fixed_cost
+        } else {
+            alloy::primitives::U256::ZERO
+        };
+
         let percentiles = if !prices_per_cycle.is_empty() {
             let mut sorted_prices = prices_per_cycle;
             compute_percentiles(&mut sorted_prices, &[10, 25, 50, 75, 90, 95, 99])
@@ -839,8 +896,12 @@ where
         let best_effective_prove_mhz_prover = None;
         let best_effective_prove_mhz_request_id = None;
 
+        let epoch_number_period_start =
+            self.epoch_calculator.get_epoch_for_timestamp(period_start).unwrap_or(0) as i64;
+
         Ok(PeriodRequestorSummary {
             period_timestamp: period_start,
+            epoch_number_period_start,
             requestor_address,
             total_fulfilled,
             unique_provers_locking_requests: unique_provers,
@@ -867,6 +928,8 @@ where
             locked_orders_fulfillment_rate_adjusted,
             total_program_cycles,
             total_cycles,
+            total_fixed_cost,
+            total_variable_cost,
             best_peak_prove_mhz,
             best_peak_prove_mhz_prover,
             best_peak_prove_mhz_request_id,
@@ -874,5 +937,117 @@ where
             best_effective_prove_mhz_prover,
             best_effective_prove_mhz_request_id,
         })
+    }
+
+    /// Aggregate epoch-based requestor data
+    pub(crate) async fn aggregate_epoch_requestor_data(
+        &self,
+        to_block: u64,
+    ) -> Result<(), ServiceError> {
+        let current_time = self.block_timestamp(to_block).await?;
+        let Some(current_epoch) = self.epoch_calculator.get_epoch_for_timestamp(current_time)
+        else {
+            tracing::debug!(
+                "Current time {} is before epoch 0, skipping epoch requestor aggregation",
+                current_time
+            );
+            return Ok(());
+        };
+
+        let start_epoch = current_epoch.saturating_sub(EPOCH_AGGREGATION_RECOMPUTE_COUNT);
+
+        for epoch_num in start_epoch..=current_epoch {
+            let boundary = self.epoch_calculator.get_epoch_boundary(epoch_num);
+            self.aggregate_epoch_requestor_data_for_epoch(
+                epoch_num,
+                boundary.start_time,
+                boundary.end_time,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Aggregate epoch-based requestor data for a time range (used by backfill)
+    pub(crate) async fn aggregate_epoch_requestor_data_from(
+        &self,
+        from_time: u64,
+        to_time: u64,
+    ) -> Result<(), ServiceError> {
+        let start = std::time::Instant::now();
+
+        for boundary in self.epoch_calculator.iter_epochs(from_time, to_time) {
+            self.aggregate_epoch_requestor_data_for_epoch(
+                boundary.epoch_number,
+                boundary.start_time,
+                boundary.end_time,
+            )
+            .await?;
+        }
+
+        tracing::debug!(
+            "aggregate_epoch_requestor_data_from {} to {} completed in {:?}",
+            from_time,
+            to_time,
+            start.elapsed()
+        );
+
+        Ok(())
+    }
+
+    async fn aggregate_epoch_requestor_data_for_epoch(
+        &self,
+        epoch_num: u64,
+        start_time: u64,
+        end_time: u64,
+    ) -> Result<(), ServiceError> {
+        let start = std::time::Instant::now();
+
+        let requestors =
+            self.db.get_active_requestor_addresses_in_period(start_time, end_time + 1).await?;
+
+        if requestors.is_empty() {
+            tracing::debug!("No active requestors in epoch {}", epoch_num);
+            return Ok(());
+        }
+
+        tracing::debug!("Processing {} requestors for epoch {}", requestors.len(), epoch_num);
+
+        let chunks = chunk_requestors(&requestors, REQUESTOR_CHUNK_SIZE);
+
+        for chunk in chunks {
+            let futures = chunk.iter().map(|requestor| {
+                self.compute_and_upsert_epoch_requestor_summary(start_time, end_time, *requestor)
+            });
+            try_join_all(futures).await?;
+        }
+
+        tracing::debug!(
+            "Aggregated epoch {} requestor data for {} requestors in {:?}",
+            epoch_num,
+            requestors.len(),
+            start.elapsed()
+        );
+
+        Ok(())
+    }
+
+    async fn compute_and_upsert_epoch_requestor_summary(
+        &self,
+        start_time: u64,
+        end_time: u64,
+        requestor: Address,
+    ) -> Result<(), ServiceError> {
+        let summary =
+            self.compute_period_requestor_summary(start_time, end_time + 1, requestor).await?;
+        // period_timestamp already contains start_time from compute_period_requestor_summary
+
+        self.db
+            .upsert_epoch_requestor_summary(summary)
+            .await
+            .with_db_context("upsert_epoch_requestor_summary")?;
+
+        Ok(())
     }
 }

@@ -35,6 +35,7 @@ deployment_secrets.toml
 
 # Ignore broker config file(s)
 *broker*.toml
+ansible/inventory.yml
 
 # Cargo
 target/
@@ -46,7 +47,6 @@ target/
 .claude
 **/CLAUDE.md
 **/AGENTS.md
-.cursor
 .codex
 
 infra/**/build
@@ -73,3 +73,5 @@ sccache-v0.*
 
 # Ignore generated docs
 /docs
+# Nightshift plan artifacts (keep out of version control)
+.nightshift-plan

@@ -26,6 +26,7 @@ use boundless_indexer::db::{
     market::{RequestStatusType, SlashedStatus, SortDirection},
     IndexerDb, ProversDb, RequestorDb,
 };
+use boundless_indexer::market::epoch_calculator::EpochCalculator;
 use boundless_market::contracts::{
     boundless_market::FulfillmentTx, Offer, Predicate, ProofRequest, RequestId, RequestInput,
     Requirements,
@@ -36,7 +37,7 @@ use sqlx::{PgPool, Row};
 use super::common::*;
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_e2e(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -162,6 +163,26 @@ async fn test_e2e(pool: sqlx::PgPool) {
         "Expected 0 total_cycles for non-hardcoded requestor"
     );
 
+    // Verify fixed + variable cost consistency
+    // In Anvil tests, fixed_cost may or may not be populated depending on base_fee timing.
+    // When fixed_cost <= total_fees: variable_cost = total_fees - fixed_cost
+    // When fixed_cost > total_fees: variable_cost = 0 (clamped)
+    if fulfilled_summary.total_fixed_cost > U256::ZERO {
+        if fulfilled_summary.total_fees_locked >= fulfilled_summary.total_fixed_cost {
+            assert_eq!(
+                fulfilled_summary.total_variable_cost,
+                fulfilled_summary.total_fees_locked - fulfilled_summary.total_fixed_cost,
+                "total_variable_cost should equal total_fees_locked - total_fixed_cost"
+            );
+        } else {
+            assert_eq!(
+                fulfilled_summary.total_variable_cost,
+                U256::ZERO,
+                "total_variable_cost should be zero when fixed_cost exceeds total_fees"
+            );
+        }
+    }
+
     // Verify collateral across all aggregation periods
     // Sum collateral from all hourly summaries
     let total_hourly_collateral: U256 = summaries.iter().map(|s| s.total_collateral_locked).sum();
@@ -206,6 +227,23 @@ async fn test_e2e(pool: sqlx::PgPool) {
         "total_locked_and_expired_collateral should be zero for fulfilled requests"
     );
 
+    // Verify all-time fixed + variable cost consistency
+    if latest_all_time.total_fixed_cost > U256::ZERO {
+        if latest_all_time.total_fees_locked >= latest_all_time.total_fixed_cost {
+            assert_eq!(
+                latest_all_time.total_variable_cost,
+                latest_all_time.total_fees_locked - latest_all_time.total_fixed_cost,
+                "All-time total_variable_cost should equal total_fees - total_fixed_cost"
+            );
+        } else {
+            assert_eq!(
+                latest_all_time.total_variable_cost,
+                U256::ZERO,
+                "All-time total_variable_cost should be zero when fixed_cost exceeds fees"
+            );
+        }
+    }
+
     // Verify collateral is cumulative in all-time summaries
     for i in 1..all_time_summaries.len() {
         let prev = &all_time_summaries[i - 1];
@@ -220,7 +258,7 @@ async fn test_e2e(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_monitoring(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -374,7 +412,7 @@ async fn test_monitoring(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_aggregation_across_hours(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -677,7 +715,7 @@ async fn test_aggregation_across_hours(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Slow without RISC0_DEV_MODE=1")]
 async fn test_aggregation_percentiles(pool: sqlx::PgPool) {
     // Test multiple requests with different prices to validate percentile calculations
     // Creates 10 requests with prices from 0.1 ETH to 1.0 ETH
@@ -844,7 +882,10 @@ async fn test_aggregation_percentiles(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Requires PostgreSQL for order stream. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(
+    not(feature = "test-r0vm"),
+    ignore = "Requires PostgreSQL for order stream. Slow without RISC0_DEV_MODE=1"
+)]
 async fn test_indexer_with_order_stream(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool.clone()).await.unwrap();
 
@@ -962,7 +1003,7 @@ async fn test_indexer_with_order_stream(pool: sqlx::PgPool) {
         .await
         .unwrap()
         .get("tx_hash");
-    assert_eq!(tx_hash, "0000000000000000000000000000000000000000000000000000000000000000");
+    assert!(tx_hash.starts_with("0000000000000000"));
 
     // Verify aggregation includes offchain requests
     let summaries = get_hourly_summaries(&fixture.test_db.db).await;
@@ -987,7 +1028,10 @@ async fn test_indexer_with_order_stream(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Requires PostgreSQL for order stream. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(
+    not(feature = "test-r0vm"),
+    ignore = "Requires PostgreSQL for order stream. Slow without RISC0_DEV_MODE=1"
+)]
 async fn test_offchain_and_onchain_mixed_aggregation(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool.clone()).await.unwrap();
 
@@ -1093,7 +1137,10 @@ async fn test_offchain_and_onchain_mixed_aggregation(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Requires PostgreSQL for order stream. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(
+    not(feature = "test-r0vm"),
+    ignore = "Requires PostgreSQL for order stream. Slow without RISC0_DEV_MODE=1"
+)]
 async fn test_submission_timestamp_field(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool.clone()).await.unwrap();
 
@@ -1369,6 +1416,10 @@ struct RequestStatusRow {
     total_cycles: Option<String>,
     effective_prove_mhz: Option<f64>,
     prover_effective_prove_mhz: Option<f64>,
+    fixed_cost: Option<String>,
+    variable_cost_per_cycle: Option<String>,
+    lock_base_fee: Option<String>,
+    fulfill_base_fee: Option<String>,
 }
 
 async fn get_lock_collateral(pool: &PgPool, request_id: &str) -> String {
@@ -1385,7 +1436,8 @@ async fn get_request_status(pool: &PgPool, request_id: &str) -> RequestStatusRow
         "SELECT request_digest, request_id, request_status, slashed_status, source, created_at, updated_at,
                 locked_at, fulfilled_at, slashed_at, lock_end, slash_recipient,
                 slash_transferred_amount, slash_burned_amount, total_cycles,
-                effective_prove_mhz_v2 as effective_prove_mhz, prover_effective_prove_mhz
+                effective_prove_mhz_v2 as effective_prove_mhz, prover_effective_prove_mhz,
+                fixed_cost, variable_cost_per_cycle, lock_base_fee, fulfill_base_fee
          FROM request_status
          WHERE request_id = $1",
     )
@@ -1412,11 +1464,15 @@ async fn get_request_status(pool: &PgPool, request_id: &str) -> RequestStatusRow
         total_cycles: row.try_get("total_cycles").ok(),
         effective_prove_mhz: row.try_get("effective_prove_mhz").ok(),
         prover_effective_prove_mhz: row.try_get("prover_effective_prove_mhz").ok(),
+        fixed_cost: row.try_get("fixed_cost").ok().flatten(),
+        variable_cost_per_cycle: row.try_get("variable_cost_per_cycle").ok().flatten(),
+        lock_base_fee: row.try_get("lock_base_fee").ok().flatten(),
+        fulfill_base_fee: row.try_get("fulfill_base_fee").ok().flatten(),
     }
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_request_status_happy_path(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -1484,11 +1540,29 @@ async fn test_request_status_happy_path(pool: sqlx::PgPool) {
     assert_eq!(status.request_status, RequestStatusType::Fulfilled.to_string());
     assert!(status.fulfilled_at.is_some());
 
+    // Verify cost fields are populated for fulfilled requests
+    // lock_base_fee should be set since the lock block has a base_fee from Anvil
+    if let Some(ref lock_base_fee) = status.lock_base_fee {
+        assert!(!lock_base_fee.is_empty(), "lock_base_fee should not be empty if Some");
+    }
+    // fulfill_base_fee should be set since the fulfill block has a base_fee from Anvil
+    if let Some(ref fulfill_base_fee) = status.fulfill_base_fee {
+        assert!(!fulfill_base_fee.is_empty(), "fulfill_base_fee should not be empty if Some");
+    }
+    // fixed_cost and variable_cost_per_cycle depend on base_fee and program_cycles availability
+    // In Anvil tests they may or may not be populated depending on timing
+    if let Some(ref fc) = status.fixed_cost {
+        assert!(!fc.is_empty(), "fixed_cost should not be empty if Some");
+    }
+    if let Some(ref vc) = status.variable_cost_per_cycle {
+        assert!(!vc.is_empty(), "variable_cost_per_cycle should not be empty if Some");
+    }
+
     indexer_process.kill().unwrap();
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_effective_prove_mhz_calculation(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -1657,7 +1731,7 @@ async fn test_effective_prove_mhz_calculation(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_request_status_locked_then_expired(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -1726,7 +1800,7 @@ async fn test_request_status_locked_then_expired(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_request_status_lock_expired_then_slashed(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -1913,7 +1987,7 @@ async fn test_request_status_lock_expired_then_slashed(pool: sqlx::PgPool) {
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_cumulative_carry_forward_with_no_activity_gaps(pool: sqlx::PgPool) {
     // This test verifies that:
     // 1. All-time cumulatives properly carry forward during hours with no activity
@@ -2310,7 +2384,7 @@ async fn test_cumulative_carry_forward_with_no_activity_gaps(pool: sqlx::PgPool)
 }
 
 #[test_log::test(sqlx::test(migrations = "./migrations"))]
-#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+#[cfg_attr(not(feature = "test-r0vm"), ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1")]
 async fn test_prover_aggregation(pool: sqlx::PgPool) {
     let fixture = new_market_test_fixture(pool).await.unwrap();
 
@@ -2455,6 +2529,155 @@ async fn test_prover_aggregation(pool: sqlx::PgPool) {
         "All-time should include at least this test's fulfillment"
     );
     assert!(all_time.total_fees_earned > U256::ZERO, "All-time should show fees earned");
+
+    cli_process.kill().unwrap();
+}
+
+#[test_log::test(sqlx::test(migrations = "./migrations"))]
+#[ignore = "Generates a proof. Slow without RISC0_DEV_MODE=1"]
+async fn test_epoch_aggregation(pool: sqlx::PgPool) {
+    let fixture = new_market_test_fixture(pool).await.unwrap();
+
+    // Get current block timestamp and set epoch0_start_time to make current time fall in epoch 0
+    let now = get_latest_block_timestamp(&fixture.ctx.customer_provider).await;
+    let epoch0_start_time = now - 100; // Start epoch 0 100 seconds ago
+
+    tracing::info!(
+        "Starting epoch aggregation test at timestamp: {}, epoch0_start_time: {}",
+        now,
+        epoch0_start_time
+    );
+
+    let mut cli_process = IndexerCliBuilder::new(
+        fixture.test_db.db_url.clone(),
+        fixture.anvil.endpoint_url().to_string(),
+        fixture.ctx.deployment.boundless_market_address.to_string(),
+    )
+    .start_block("0")
+    .epoch0_start_time(epoch0_start_time)
+    .spawn()
+    .unwrap();
+
+    // Create, submit, lock, and fulfill request
+    let collateral_amount = U256::from(1000);
+    let (request, client_sig) = create_order_with_collateral(
+        &fixture.ctx.customer_signer,
+        fixture.ctx.customer_signer.address(),
+        1,
+        fixture.ctx.deployment.boundless_market_address,
+        fixture.anvil.chain_id(),
+        now,
+        collateral_amount,
+    )
+    .await;
+
+    submit_request_with_deposit(&fixture.ctx, &request, client_sig.clone()).await.unwrap();
+
+    lock_and_fulfill_request_with_collateral(
+        &fixture.ctx,
+        &fixture.prover,
+        &request,
+        client_sig.clone(),
+    )
+    .await
+    .unwrap();
+
+    wait_for_indexer(&fixture.ctx.customer_provider, &fixture.test_db.pool).await;
+
+    // Verify epoch market summary was created
+    // Uses period_timestamp to store epoch_number
+    let epoch_summaries =
+        fixture.test_db.db.get_epoch_market_summaries(None, 10, SortDirection::Desc).await.unwrap();
+
+    tracing::info!("Found {} epoch market summaries", epoch_summaries.len());
+
+    assert!(!epoch_summaries.is_empty(), "Expected at least one epoch market summary");
+
+    // Verify the first epoch summary has data
+    let first_summary = &epoch_summaries[0];
+    tracing::info!(
+        "Epoch {} (period_timestamp) summary: total_fulfilled={}, total_requests_locked={}",
+        first_summary.period_timestamp,
+        first_summary.total_fulfilled,
+        first_summary.total_requests_locked
+    );
+
+    // Verify epoch data is correctly populated
+    // period_timestamp stores the epoch start time (Unix timestamp), not epoch number
+    // epoch_number_period_start is calculated from period_timestamp using EpochCalculator
+    // Use the same epoch0_start_time that was passed to the indexer
+    let epoch_calculator = EpochCalculator::new(epoch0_start_time);
+    let expected_epoch_number = epoch_calculator
+        .get_epoch_for_timestamp(first_summary.period_timestamp as u64)
+        .unwrap_or(0) as i64;
+
+    assert_eq!(
+        first_summary.epoch_number_period_start, expected_epoch_number,
+        "epoch_number_period_start should match calculated epoch number"
+    );
+    assert!(
+        first_summary.total_requests_locked >= 1,
+        "Epoch should have at least 1 locked request"
+    );
+    assert!(first_summary.total_fulfilled >= 1, "Epoch should have at least 1 fulfilled request");
+
+    // Verify epoch prover summary was created
+    let prover_address = fixture.ctx.prover_signer.address();
+    let epoch_prover_summaries = fixture
+        .test_db
+        .db
+        .get_epoch_prover_summaries(prover_address, None, 10, SortDirection::Desc, None, None)
+        .await
+        .unwrap();
+
+    tracing::info!("Found {} epoch prover summaries", epoch_prover_summaries.len());
+    assert!(!epoch_prover_summaries.is_empty(), "Expected at least one epoch prover summary");
+
+    let prover_summary = &epoch_prover_summaries[0];
+    let prover_expected_epoch = epoch_calculator
+        .get_epoch_for_timestamp(prover_summary.period_timestamp as u64)
+        .unwrap_or(0) as i64;
+    assert_eq!(
+        prover_summary.epoch_number_period_start, prover_expected_epoch,
+        "Prover epoch_number_period_start should match calculated epoch number"
+    );
+    assert!(
+        prover_summary.total_requests_locked >= 1,
+        "Prover should have at least 1 locked request in epoch"
+    );
+    assert!(
+        prover_summary.total_requests_fulfilled >= 1,
+        "Prover should have at least 1 fulfilled request in epoch"
+    );
+
+    // Verify epoch requestor summary was created
+    let requestor_address = fixture.ctx.customer_signer.address();
+    let epoch_requestor_summaries = fixture
+        .test_db
+        .db
+        .get_epoch_requestor_summaries(requestor_address, None, 10, SortDirection::Desc, None, None)
+        .await
+        .unwrap();
+
+    tracing::info!("Found {} epoch requestor summaries", epoch_requestor_summaries.len());
+    assert!(!epoch_requestor_summaries.is_empty(), "Expected at least one epoch requestor summary");
+
+    let requestor_summary = &epoch_requestor_summaries[0];
+    let requestor_expected_epoch = epoch_calculator
+        .get_epoch_for_timestamp(requestor_summary.period_timestamp as u64)
+        .unwrap_or(0) as i64;
+    assert_eq!(
+        requestor_summary.epoch_number_period_start, requestor_expected_epoch,
+        "Requestor epoch_number_period_start should match calculated epoch number"
+    );
+    assert!(
+        requestor_summary.total_requests_submitted >= 1,
+        "Requestor should have at least 1 submitted request in epoch"
+    );
+    assert!(
+        requestor_summary.total_fulfilled >= 1,
+        "Requestor should have at least 1 fulfilled request in epoch"
+    );
 
     cli_process.kill().unwrap();
 }

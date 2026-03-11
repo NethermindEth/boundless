@@ -114,6 +114,7 @@ fn generate_test_order(request_id: u32) -> Order {
         boundless_market_address: Address::ZERO,
         chain_id: 1,
         total_cycles: None,
+        journal_bytes: None,
         proving_started_at: None,
         cached_id: Default::default(),
     }
@@ -122,6 +123,7 @@ fn generate_test_order(request_id: u32) -> Order {
 // Main fuzz test function
 proptest! {
     #[test]
+    #[ignore = "Ignore by default because slow and no longer necessary to check for each change"]
     fn fuzz_db_operations(operations in prop::collection::vec(any::<DbOperation>(), 1..1000)) {
         // Create a multi-threaded runtime with 4 worker threads
         let rt = Builder::new_multi_thread()

@@ -4,6 +4,7 @@ import * as awsx from '@pulumi/awsx';
 import * as docker_build from '@pulumi/docker-build';
 import { getEnvVar, getServiceNameV1 } from '../util';
 import { OrderGenerator } from './components/order-generator';
+import { LoadTestTrigger } from './components/load-test';
 
 require('dotenv').config();
 
@@ -15,6 +16,7 @@ export = () => {
   const chainId = isDev ? getEnvVar("CHAIN_ID") : baseConfig.require('CHAIN_ID');
   const pinataJWT = isDev ? pulumi.output(getEnvVar("PINATA_JWT")) : baseConfig.requireSecret('PINATA_JWT');
   const ethRpcUrl = isDev ? pulumi.output(getEnvVar("ETH_RPC_URL")) : baseConfig.requireSecret('ETH_RPC_URL');
+  const indexerUrl = isDev ? pulumi.output(getEnvVar("INDEXER_URL")) : baseConfig.requireSecret('INDEXER_URL');
   const orderStreamUrl = isDev
     ? pulumi.output(getEnvVar("ORDER_STREAM_URL"))
     : (baseConfig.getSecret('ORDER_STREAM_URL') || pulumi.output(""));
@@ -117,6 +119,7 @@ export = () => {
   } else {
     offchainPrivateKey = offchainConfig.requireSecret('PRIVATE_KEY');
   }
+  const offchainInputMinMCycles = offchainConfig.get('INPUT_MIN_MCYCLES');
   const offchainInputMaxMCycles = offchainConfig.get('INPUT_MAX_MCYCLES') ?? "1000";
   const offchainRampUp = offchainConfig.get('RAMP_UP');
   const offchainLockTimeout = offchainConfig.get('LOCK_TIMEOUT');
@@ -126,9 +129,9 @@ export = () => {
   const offchainInterval = offchainConfig.get('INTERVAL');
   const offchainExecRateKhz = offchainConfig.get('EXEC_RATE_KHZ');
   const offchainMaxPricePerMCycle = offchainConfig.get('MAX_PRICE_PER_MCYCLE');
+  const offchainMaxPriceCap = offchainConfig.get('MAX_PRICE_CAP');
 
   if (offchainPrivateKey) {
-    const offchainMaxPrice = offchainMaxPricePerMCycle ?? offchainConfig.require('MAX_PRICE_PER_MCYCLE');
     new OrderGenerator('offchain', {
       chainId,
       stackName,
@@ -149,11 +152,12 @@ export = () => {
       interval: offchainInterval ?? interval,
       lockCollateralRaw,
       minPricePerMCycle,
-      maxPricePerMCycle: offchainMaxPrice,
+      maxPricePerMCycle: offchainMaxPricePerMCycle,
       vpcId,
       privateSubnetIds,
       boundlessAlertsTopicArns: alertsTopicArns,
       txTimeout,
+      inputMinMCycles: offchainInputMinMCycles,
       inputMaxMCycles: offchainInputMaxMCycles,
       rampUp: offchainRampUp,
       rampUpSecondsPerMCycle: offchainRampUpSecondsPerMCycle,
@@ -161,6 +165,9 @@ export = () => {
       timeout: offchainTimeout,
       secondsPerMCycle: offchainSecondsPerMCycle,
       execRateKhz: offchainExecRateKhz,
+      indexerUrl,
+      useZeth: false,
+      maxPriceCap: offchainMaxPriceCap,
     });
   }
 
@@ -174,6 +181,7 @@ export = () => {
   } else {
     onchainPrivateKey = onchainConfig.requireSecret('PRIVATE_KEY');
   }
+  const onchainInputMinMCycles = onchainConfig.get('INPUT_MIN_MCYCLES');
   const onchainInputMaxMCycles = onchainConfig.get('INPUT_MAX_MCYCLES');
   const onchainRampUp = onchainConfig.get('RAMP_UP');
   const onchainLockTimeout = onchainConfig.get('LOCK_TIMEOUT');
@@ -183,9 +191,9 @@ export = () => {
   const onchainInterval = onchainConfig.get('INTERVAL');
   const onchainExecRateKhz = onchainConfig.get('EXEC_RATE_KHZ');
   const onchainMaxPricePerMCycle = onchainConfig.get('MAX_PRICE_PER_MCYCLE');
+  const onchainMaxPriceCap = onchainConfig.get('MAX_PRICE_CAP');
 
   if (onchainPrivateKey) {
-    const onchainMaxPrice = onchainMaxPricePerMCycle ?? onchainConfig.require('MAX_PRICE_PER_MCYCLE');
     new OrderGenerator('onchain', {
       chainId,
       stackName,
@@ -203,9 +211,10 @@ export = () => {
       interval: onchainInterval ?? interval,
       lockCollateralRaw,
       rampUp: onchainRampUp,
+      inputMinMCycles: onchainInputMinMCycles,
       inputMaxMCycles: onchainInputMaxMCycles,
       minPricePerMCycle,
-      maxPricePerMCycle: onchainMaxPrice,
+      maxPricePerMCycle: onchainMaxPricePerMCycle,
       secondsPerMCycle: onchainSecondsPerMCycle,
       rampUpSecondsPerMCycle: onchainRampUpSecondsPerMCycle,
       vpcId,
@@ -215,6 +224,9 @@ export = () => {
       lockTimeout: onchainLockTimeout,
       timeout: onchainTimeout,
       execRateKhz: onchainExecRateKhz,
+      indexerUrl,
+      useZeth: false,
+      maxPriceCap: onchainMaxPriceCap,
     });
   }
 
@@ -234,6 +246,7 @@ export = () => {
     const randomRequestorAutoDeposit = randomRequestorConfig.get('AUTO_DEPOSIT');
     const randomRequestorWarnBalanceBelow = randomRequestorConfig.get('WARN_BALANCE_BELOW');
     const randomRequestorErrorBalanceBelow = randomRequestorConfig.get('ERROR_BALANCE_BELOW');
+    const randomRequestorInputMinMCycles = randomRequestorConfig.get('INPUT_MIN_MCYCLES');
     const randomRequestorInputMaxMCycles = randomRequestorConfig.get('INPUT_MAX_MCYCLES');
     const randomRequestorRampUp = randomRequestorConfig.get('RAMP_UP');
     const randomRequestorLockTimeout = randomRequestorConfig.get('LOCK_TIMEOUT');
@@ -242,6 +255,7 @@ export = () => {
     const randomRequestorRampUpSecondsPerMCycle = randomRequestorConfig.get('RAMP_UP_SECONDS_PER_MCYCLE');
     const randomRequestorExecRateKhz = randomRequestorConfig.get('EXEC_RATE_KHZ');
     const randomRequestorMaxPricePerMCycle = randomRequestorConfig.get('MAX_PRICE_PER_MCYCLE');
+    const randomRequestorMaxPriceCap = randomRequestorConfig.get('MAX_PRICE_CAP');
 
     new OrderGenerator('random-requestor', {
       chainId,
@@ -260,9 +274,10 @@ export = () => {
       interval: randomRequestorInterval,
       lockCollateralRaw,
       rampUp: randomRequestorRampUp,
+      inputMinMCycles: randomRequestorInputMinMCycles,
       inputMaxMCycles: randomRequestorInputMaxMCycles,
       minPricePerMCycle,
-      maxPricePerMCycle: randomRequestorMaxPricePerMCycle ?? minPricePerMCycle,
+      maxPricePerMCycle: randomRequestorMaxPricePerMCycle,
       secondsPerMCycle: randomRequestorSecondsPerMCycle,
       rampUpSecondsPerMCycle: randomRequestorRampUpSecondsPerMCycle,
       vpcId,
@@ -276,6 +291,96 @@ export = () => {
         count: randomRequestorCount,
         scheduleExpression: randomRequestorScheduleExpression,
       },
+      indexerUrl,
+      useZeth: false,
+      maxPriceCap: randomRequestorMaxPriceCap,
+    });
+  }
+
+  const evmRequestorConfig = new pulumi.Config("order-generator-evm-requestor");
+  const evmRequestorAutoDeposit = evmRequestorConfig.get('AUTO_DEPOSIT');
+  const evmRequestorWarnBalanceBelow = evmRequestorConfig.get('WARN_BALANCE_BELOW');
+  const evmRequestorErrorBalanceBelow = evmRequestorConfig.get('ERROR_BALANCE_BELOW');
+  let evmRequestorPrivateKey: pulumi.Output<string> | undefined;
+  if (isDev && process.env.EVM_REQUESTOR_PRIVATE_KEY) {
+    evmRequestorPrivateKey = pulumi.output(process.env.EVM_REQUESTOR_PRIVATE_KEY);
+  } else {
+    evmRequestorPrivateKey = evmRequestorConfig.getSecret('PRIVATE_KEY');
+  }
+  const evmRequestorInterval = evmRequestorConfig.get('INTERVAL');
+  const evmRequestorInputMinMCycles = evmRequestorConfig.get('INPUT_MIN_MCYCLES');
+  const evmRequestorInputMaxMCycles = evmRequestorConfig.get('INPUT_MAX_MCYCLES');
+  const evmRequestorRampUp = evmRequestorConfig.get('RAMP_UP');
+  const evmRequestorLockTimeout = evmRequestorConfig.get('LOCK_TIMEOUT');
+  const evmRequestorTimeout = evmRequestorConfig.get('TIMEOUT');
+  const evmRequestorSecondsPerMCycle = evmRequestorConfig.get('SECONDS_PER_MCYCLE');
+  const evmRequestorRampUpSecondsPerMCycle = evmRequestorConfig.get('RAMP_UP_SECONDS_PER_MCYCLE');
+  const evmRequestorExecRateKhz = evmRequestorConfig.get('EXEC_RATE_KHZ');
+  const evmRequestorMaxPricePerMCycle = evmRequestorConfig.get('MAX_PRICE_PER_MCYCLE');
+  const evmRequestorMaxPriceCap = evmRequestorConfig.get('MAX_PRICE_CAP');
+
+  if (evmRequestorPrivateKey) {
+    new OrderGenerator('evm-requestor', {
+      chainId,
+      stackName,
+      autoDeposit: evmRequestorAutoDeposit,
+      warnBalanceBelow: evmRequestorWarnBalanceBelow,
+      errorBalanceBelow: evmRequestorErrorBalanceBelow,
+      privateKey: evmRequestorPrivateKey,
+      pinataJWT,
+      ethRpcUrl,
+      image,
+      logLevel,
+      setVerifierAddr,
+      boundlessMarketAddr,
+      ipfsGateway,
+      interval: evmRequestorInterval ?? interval,
+      lockCollateralRaw,
+      rampUp: evmRequestorRampUp,
+      inputMinMCycles: evmRequestorInputMinMCycles,
+      inputMaxMCycles: evmRequestorInputMaxMCycles,
+      minPricePerMCycle,
+      maxPricePerMCycle: evmRequestorMaxPricePerMCycle,
+      secondsPerMCycle: evmRequestorSecondsPerMCycle,
+      rampUpSecondsPerMCycle: evmRequestorRampUpSecondsPerMCycle,
+      vpcId,
+      privateSubnetIds,
+      boundlessAlertsTopicArns: alertsTopicArns,
+      txTimeout,
+      lockTimeout: evmRequestorLockTimeout,
+      timeout: evmRequestorTimeout,
+      execRateKhz: evmRequestorExecRateKhz,
+      indexerUrl,
+      useZeth: true,
+      maxPriceCap: evmRequestorMaxPriceCap,
+    });
+  }
+
+  const loadTestConfig = new pulumi.Config("order-generator-load-test");
+  let loadTestPrivateKey: pulumi.Output<string> | undefined;
+  if (isDev && process.env.LOAD_TEST_PRIVATE_KEY) {
+    loadTestPrivateKey = pulumi.output(process.env.LOAD_TEST_PRIVATE_KEY);
+  } else {
+    loadTestPrivateKey = loadTestConfig.getSecret('PRIVATE_KEY');
+  }
+
+  if (loadTestPrivateKey) {
+    new LoadTestTrigger({
+      chainId,
+      stackName,
+      privateKey: loadTestPrivateKey,
+      pinataJWT,
+      ethRpcUrl,
+      indexerUrl,
+      orderStreamUrl,
+      image,
+      logLevel,
+      setVerifierAddr: setVerifierAddr,
+      boundlessMarketAddr: boundlessMarketAddr,
+      ipfsGateway,
+      lockCollateralRaw,
+      vpcId,
+      privateSubnetIds,
     });
   }
 };

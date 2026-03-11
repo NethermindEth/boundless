@@ -1,34 +1,45 @@
 # Configuration Variables
 
-This document describes all configuration variables for the Boundless Ansible deployment.
+This document describes all configuration variables for the Boundless Ansible deployment. **Do not commit real credentials, IPs, or secrets**—use placeholders in the repo and supply real values via inventory (e.g. CI secret or Vault).
 
 ## Variable Precedence
 
 Ansible variable precedence (highest to lowest):
 
 1. **Command-line variables** (`-e var=value`)
-2. **Inventory host variables** (in `inventory.yml`)
-3. **Role defaults** (`roles/*/defaults/main.yml`)
+2. **Inventory host variables** (per-host in `inventory.yml`)
+3. **Inventory group variables** (e.g. `staging.vars`, `production.vars`, `all.vars` in `inventory.yml`)
+4. **Role defaults** (`roles/*/defaults/main.yml`)
+
+The inventory uses `all.vars` for `ansible_user`, `prover_version`, and `ufw_docker_nat_enabled`. Staging and production set `vector_aws_access_key_id` and `vector_aws_secret_access_key` so hosts in those groups inherit AWS credentials for Vector without per-host duplication.
 
 ## Quick Start
 
 ### Using Inventory Variables
 
-Set variables directly in your inventory file:
+Variables can be set in `all.vars`, group `vars` (e.g. `staging`, `production`), or per host:
 
 ```yaml
 all:
+  vars:
+    ansible_user: ubuntu
+    prover_version: main
+    ufw_docker_nat_enabled: true
   children:
-    nightly:
+    staging:
+      vars:
+        vector_aws_access_key_id: "AKIA..."
+        vector_aws_secret_access_key: "..."
+      children:
+        prover_84532_staging_nightly:
+    prover_84532_staging_nightly:
       hosts:
         127.0.0.1:
-          ansible_user: ubuntu
-          prover_version: main
           prover_postgres_password: "secure_password"
           prover_minio_root_pass: "secure_password"
           prover_private_key: "0x..."
           prover_povw_log_id: "0x..."
-          prover_rpc_url: "https://..."
+          prover_rpc_urls: "https://..."
 ```
 
 ### Using Command-Line Variables
@@ -43,12 +54,25 @@ ansible-playbook -i inventory.yml prover.yml \
 
 ### Deployment Configuration
 
-| Variable         | Default      | Description                        |
-| ---------------- | ------------ | ---------------------------------- |
-| `prover_dir`     | `/opt/bento` | Directory where prover is deployed |
-| `prover_version` | `v1.2.0`     | Git tag or branch to deploy        |
-| `prover_state`   | `started`    | Service state (started, stopped)   |
-| `prover_user`    | `ubuntu`     | User for Docker commands           |
+| Variable         | Default      | Description                                                             |
+| ---------------- | ------------ | ----------------------------------------------------------------------- |
+| `prover_dir`     | `/opt/bento` | Directory where prover is deployed                                      |
+| `prover_version` | `v1.2.1`     | Git tag or branch to deploy (inventory often sets `main` in `all.vars`) |
+| `prover_state`   | `started`    | Service state (started, stopped)                                        |
+| `prover_user`    | `ubuntu`     | User for Docker commands                                                |
+
+### Dockerfiles and Compose (prover vs explorer)
+
+| Variable                        | Default / typical                       | Description                                                                               |
+| ------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `prover_agent_dockerfile`       | `dockerfiles/agent.prebuilt.dockerfile` | Agent image (explorer CPU: `agent.cpu.dockerfile`; build from source: `agent.dockerfile`) |
+| `prover_rest_api_dockerfile`    | (role default)                          | REST API Dockerfile path                                                                  |
+| `prover_broker_dockerfile`      | (role default)                          | Broker Dockerfile path (when broker is used)                                              |
+| `prover_docker_compose_invoke`  | `""`                                    | Services to run (e.g. `exec_agent rest_api caddy` for explorer)                           |
+| `prover_docker_compose_profile` | `--profile broker --profile miner`      | Compose profiles (explorer: `--profile caddy`)                                            |
+| `prover_docker_runtime`         | `nvidia`                                | Docker runtime (`runc` for CPU-only explorer)                                             |
+
+Explorer hosts also use Caddy variables: `caddy_domain`, `caddy_acme_email`, `caddy_auth_enabled`, `caddy_api_key`, `prover_caddy_file`. See `inventory.yml` and the prover role templates for current names and usage.
 
 ### Database Configuration (PostgreSQL)
 
@@ -62,9 +86,10 @@ ansible-playbook -i inventory.yml prover.yml \
 
 ### Redis/Valkey Configuration
 
-| Variable            | Default | Description                          |
-| ------------------- | ------- | ------------------------------------ |
-| `prover_redis_host` | `redis` | Redis hostname (Docker service name) |
+| Variable                | Default | Description                                    |
+| ----------------------- | ------- | ---------------------------------------------- |
+| `prover_redis_host`     | `redis` | Redis hostname (Docker service name)           |
+| `prover_redis_password` | `""`    | Optional Redis AUTH password (empty = no auth) |
 
 ### MinIO/S3 Configuration
 
@@ -77,14 +102,14 @@ ansible-playbook -i inventory.yml prover.yml \
 
 ### Prover Agent Configuration
 
-| Variable                  | Default            | Description                     |
-| ------------------------- | ------------------ | ------------------------------- |
-| `prover_rust_log`         | `info`             | Rust log level                  |
-| `prover_risc0_home`       | `/usr/local/risc0` | RISC0 home directory            |
-| `prover_segment_size`     | `20`               | Segment size for proving        |
-| `prover_risc0_keccak_po2` | `17`               | Keccak power of 2               |
-| `prover_redis_ttl`        | `57600`            | Redis TTL in seconds (16 hours) |
-| `prover_snark_timeout`    | `180`              | SNARK timeout in seconds        |
+| Variable                  | Default                                    | Description                     |
+| ------------------------- | ------------------------------------------ | ------------------------------- |
+| `prover_rust_log`         | `info,broker=debug,boundless_market=debug` | Rust log level                  |
+| `prover_risc0_home`       | `/usr/local/risc0`                         | RISC0 home directory            |
+| `prover_segment_size`     | `20`                                       | Segment size for proving        |
+| `prover_risc0_keccak_po2` | `17`                                       | Keccak power of 2               |
+| `prover_redis_ttl`        | `57600`                                    | Redis TTL in seconds (16 hours) |
+| `prover_snark_timeout`    | `180`                                      | SNARK timeout in seconds        |
 
 ### Binary Configuration
 
@@ -96,12 +121,13 @@ ansible-playbook -i inventory.yml prover.yml \
 
 These variables enable the broker service:
 
-| Variable                 | Default        | Description                 |
-| ------------------------ | -------------- | --------------------------- |
-| `prover_private_key`     | `""`           | Prover wallet private key   |
-| `prover_rpc_url`         | `""`           | Blockchain RPC URL          |
-| `prover_povw_log_id`     | `""`           | POVW log contract address   |
-| `prover_broker_toml_url` | GitHub raw URL | URL to broker.toml template |
+| Variable                 | Default        | Description                       |
+| ------------------------ | -------------- | --------------------------------- |
+| `prover_private_key`     | `""`           | Prover wallet private key         |
+| `prover_rpc_url`         | `""`           | Single RPC URL (legacy)           |
+| `prover_rpc_urls`        | `""`           | RPC URL(s) for broker (preferred) |
+| `prover_povw_log_id`     | `""`           | POVW log contract address         |
+| `prover_broker_toml_url` | GitHub raw URL | URL to broker.toml template       |
 
 ## Docker Role Variables
 
@@ -110,13 +136,13 @@ These variables enable the broker service:
 | `docker_ubuntu_version` | (auto-detected) | Ubuntu version override         |
 | `docker_architecture`   | `amd64`         | CPU architecture                |
 | `docker_users`          | `[]`            | Users to add to docker group    |
-| `docker_nvidia_enabled` | `false`         | Enable NVIDIA Container Toolkit |
+| `docker_nvidia_enabled` | `true`          | Enable NVIDIA Container Toolkit |
 
 ## NVIDIA Role Variables
 
 | Variable                      | Default         | Description               |
 | ----------------------------- | --------------- | ------------------------- |
-| `nvidia_cuda_version`         | `13-0`          | CUDA version to install   |
+| `nvidia_cuda_version`         | `13-1`          | CUDA version to install   |
 | `nvidia_ubuntu_version`       | (auto-detected) | Ubuntu version override   |
 | `nvidia_reboot_after_install` | `false`         | Reboot after installation |
 
@@ -127,8 +153,8 @@ These variables enable the broker service:
 | Variable                 | Default   | Description    |
 | ------------------------ | --------- | -------------- |
 | `vector_install`         | `true`    | Install Vector |
-| `vector_service_enabled` | `false`   | Enable at boot |
-| `vector_service_state`   | `stopped` | Service state  |
+| `vector_service_enabled` | `true`    | Enable at boot |
+| `vector_service_state`   | `started` | Service state  |
 
 ### CloudWatch Configuration
 
@@ -147,6 +173,16 @@ These variables enable the broker service:
 | `vector_aws_access_key_id`        | `null`  | AWS access key ID            |
 | `vector_aws_secret_access_key`    | `null`  | AWS secret access key        |
 
+### Monitoring and Metrics
+
+| Variable                         | Default                            | Description                              |
+| -------------------------------- | ---------------------------------- | ---------------------------------------- |
+| `vector_monitor_services`        | `["bento.service"]`                | Systemd units to ingest from journald    |
+| `vector_host_metrics_collectors` | `["memory", "disk", "filesystem"]` | Enabled host metrics collectors          |
+| `vector_metrics_scrape_interval` | `15`                               | Host metrics scrape interval (seconds)   |
+| `vector_track_bento_process`     | `true`                             | Emit `bento_active` and container gauges |
+| `vector_track_log_errors`        | `true`                             | Emit `bento_log_errors` metric           |
+
 ## AWS CLI Role Variables
 
 | Variable                | Default              | Description                            |
@@ -156,52 +192,62 @@ These variables enable the broker service:
 | `awscli_bin_dir`        | `/usr/local/bin`     | Binary directory                       |
 | `awscli_update`         | `false`              | Update existing installation           |
 
+## UFW Role Variables
+
+Used by `security.yml` and the `ufw` role:
+
+| Variable                 | Default  | Description                                                     |
+| ------------------------ | -------- | --------------------------------------------------------------- |
+| `ufw_docker_nat_enabled` | `true`   | If true, add Docker NAT rules when Docker has `iptables: false` |
+| `ufw_allowed_ports`      | (varies) | List of `{ port, proto, comment }` for UFW allow rules          |
+
+See `roles/ufw/README.md` and `roles/ufw/defaults/main.yml` for full UFW options.
+
 ## Example Configurations
 
-### Minimal Production Setup
+### All-group and staging/production vars (current style)
 
 ```yaml
 all:
-  hosts:
-    prover-1:
-      ansible_user: ubuntu
-      prover_version: v1.2.0
-      prover_postgres_password: "{{ vault_postgres_password }}"
-      prover_minio_root_pass: "{{ vault_minio_password }}"
-      prover_private_key: "{{ vault_prover_key }}"
-      prover_povw_log_id: "0x..."
-      prover_rpc_url: "https://mainnet.infura.io/v3/..."
-```
-
-### Nightly Build Setup
-
-```yaml
-all:
+  vars:
+    ansible_user: ubuntu
+    prover_version: main
+    ufw_docker_nat_enabled: true
   children:
-    nightly:
+    production:
+      vars:
+        vector_aws_access_key_id: "AKIA..."
+        vector_aws_secret_access_key: "..."
+      children:
+        prover_8453_production_release:
+    prover_8453_production_release:
       hosts:
-        dev-prover:
-          ansible_user: ubuntu
-          prover_version: main
-          prover_postgres_password: "dev_password"
-          prover_minio_root_pass: "dev_password"
+        10.0.0.2:
+          prover_postgres_password: "{{ vault_postgres_password }}"
+          prover_minio_root_pass: "{{ vault_minio_password }}"
+          prover_private_key: "{{ vault_prover_key }}"
+          prover_povw_log_id: "0x..."
+          prover_rpc_urls: "https://mainnet.example.com/..."
 ```
 
-### With Vector Logging
+### Nightly-style host (build from source)
 
 ```yaml
-all:
+prover_84532_staging_nightly:
   hosts:
-    prover-1:
-      ansible_user: ubuntu
-      prover_version: v1.2.0
-      # Vector configuration
-      vector_service_enabled: true
-      vector_service_state: started
-      vector_cloudwatch_log_group: "/boundless/production"
-      vector_aws_access_key_id: "AKIA..."
-      vector_aws_secret_access_key: "..."
+    dev-prover:
+      prover_agent_dockerfile: dockerfiles/agent.dockerfile
+      prover_rest_api_dockerfile: dockerfiles/rest_api.dockerfile
+      prover_broker_dockerfile: dockerfiles/broker.dockerfile
+      prover_postgres_password: "dev_password"
+      prover_minio_root_pass: "dev_password"
+      prover_rpc_urls: "https://..."
+      prover_broker_toml_url: "https://raw.githubusercontent.com/.../staging_84532.toml"
 ```
+
+### Vector logging (credentials from group vars)
+
+Set `vector_aws_access_key_id` and `vector_aws_secret_access_key` on the parent group (`staging` or `production`) so all hosts in that environment inherit them. Override per host only if needed.
 
 ## Security Best Practices
 

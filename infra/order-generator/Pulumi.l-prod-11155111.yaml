@@ -18,11 +18,9 @@ config:
   order-generator-base:GH_TOKEN_SECRET:
     secure: v1:R9fQgMpBuzjpJ7Bc:k0n/Ge/THuxbfMgnqW9621TLbLbSfwjACH+jsSZPZGUoCW+qUxXn5+q1n/9MCehtNGwCmC2Z6XaoAEt8RjDwQXreFZEbeBXOdLbpQu+gPxRwsBEUvjKF4aMHfeV1Fvy+v4GAocDaq39fYstZKg==
   order-generator-base:INTERVAL: "600"
-  order-generator-base:IPFS_GATEWAY_URL: https://dweb.link
+  order-generator-base:IPFS_GATEWAY_URL: https://gateway.beboundless.cloud
   order-generator-base:LOCK_COLLATERAL_RAW: "5000000000000000000"
   order-generator-base:LOG_LEVEL: "info,boundless_market=debug"
-  order-generator-offchain:MAX_PRICE_PER_MCYCLE: "0.00002"
-  order-generator-onchain:MAX_PRICE_PER_MCYCLE: "0.000025"
   order-generator-base:MIN_PRICE_PER_MCYCLE: "0"
   order-generator-base:ORDER_STREAM_URL: https://eth-sepolia.boundless.network
   order-generator-base:PAGERDUTY_ALERTS_TOPIC_ARN: arn:aws:sns:us-west-2:968153779208:boundless-pagerduty-topic
@@ -53,3 +51,7 @@ config:
   order-generator-offchain:EXEC_RATE_KHZ: "500"
   order-generator-onchain:EXEC_RATE_KHZ: "500"
   order-generator-onchain:INTERVAL: "600"
+  order-generator-base:INDEXER_URL:
+    secure: v1:+nrnPjvFF6klXo5D:cfXy8A3jcOpCYpq5kTrlMK4Ex7eikZY9ZxMZMYruUzijAx9JQchoS4CraplHDnbGjIYityz7
+  order-generator-load-test:PRIVATE_KEY:
+    secure: v1:bW54F1/kSy1V3R01:L1Xy88iABW6zQ1L9eNiljHGtLeBfydj9sxe3n5uccaXA2IvKq4IrcFk5wM4/OtyLzAjmwoT412270P1Vo488ep3MHdsnAqeyGSGLzsxt/BU=

@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::super::{
-    IndexerService, DAILY_AGGREGATION_RECOMPUTE_DAYS, HOURLY_AGGREGATION_RECOMPUTE_HOURS,
-    MONTHLY_AGGREGATION_RECOMPUTE_MONTHS, SECONDS_PER_DAY, SECONDS_PER_HOUR, SECONDS_PER_WEEK,
-    WEEKLY_AGGREGATION_RECOMPUTE_WEEKS,
+    DbResultExt, IndexerService, DAILY_AGGREGATION_RECOMPUTE_DAYS,
+    HOURLY_AGGREGATION_RECOMPUTE_HOURS, MONTHLY_AGGREGATION_RECOMPUTE_MONTHS, SECONDS_PER_DAY,
+    SECONDS_PER_HOUR, SECONDS_PER_WEEK, WEEKLY_AGGREGATION_RECOMPUTE_WEEKS,
 };
+use super::epochs::EPOCH_AGGREGATION_RECOMPUTE_COUNT;
 use crate::db::market::{AllTimeMarketSummary, IndexerDb, PeriodMarketSummary};
 use crate::market::{
     pricing::compute_percentiles,
@@ -89,7 +90,10 @@ where
         for (hour_ts, hour_end) in iter_hourly_periods(from_time, to_time) {
             let summary = self.compute_period_summary(hour_ts, hour_end).await?;
             // Always upsert, even if all values are zero - this ensures continuous time series
-            self.db.upsert_hourly_market_summary(summary).await?;
+            self.db
+                .upsert_hourly_market_summary(summary)
+                .await
+                .with_db_context("upsert_hourly_market_summary")?;
         }
 
         tracing::info!("aggregate_hourly_market_data_from completed in {:?}", start.elapsed());
@@ -145,7 +149,10 @@ where
         for (day_ts, day_end) in iter_daily_periods(from_time, to_time) {
             let summary = self.compute_period_summary(day_ts, day_end).await?;
             // Always upsert, even if all values are zero - this ensures continuous time series
-            self.db.upsert_daily_market_summary(summary).await?;
+            self.db
+                .upsert_daily_market_summary(summary)
+                .await
+                .with_db_context("upsert_daily_market_summary")?;
         }
 
         tracing::info!("aggregate_daily_market_data_from completed in {:?}", start.elapsed());
@@ -201,7 +208,10 @@ where
         for (week_ts, week_end) in iter_weekly_periods(from_time, to_time) {
             let summary = self.compute_period_summary(week_ts, week_end).await?;
             // Always upsert, even if all values are zero - this ensures continuous time series
-            self.db.upsert_weekly_market_summary(summary).await?;
+            self.db
+                .upsert_weekly_market_summary(summary)
+                .await
+                .with_db_context("upsert_weekly_market_summary")?;
         }
 
         tracing::info!("aggregate_weekly_market_data_from completed in {:?}", start.elapsed());
@@ -268,7 +278,10 @@ where
         for (month_ts, month_end) in iter_monthly_periods(from_time, to_time) {
             let summary = self.compute_period_summary(month_ts, month_end).await?;
             // Always upsert, even if all values are zero - this ensures continuous time series
-            self.db.upsert_monthly_market_summary(summary).await?;
+            self.db
+                .upsert_monthly_market_summary(summary)
+                .await
+                .with_db_context("upsert_monthly_market_summary")?;
         }
 
         tracing::info!("aggregate_monthly_market_data_from completed in {:?}", start.elapsed());
@@ -280,7 +293,7 @@ where
         period_start: u64,
         period_end: u64,
     ) -> Result<PeriodMarketSummary, ServiceError> {
-        // Execute all initial database queries in parallel
+        // Execute database queries in 3 sequential batches to parallelize without overloading the database
         let (
             total_fulfilled,
             unique_provers,
@@ -288,16 +301,6 @@ where
             total_requests_submitted,
             total_requests_submitted_onchain,
             total_requests_locked,
-            total_requests_slashed,
-            total_expired,
-            total_locked_and_expired,
-            total_locked_and_fulfilled,
-            total_secondary_fulfillments,
-            locks,
-            all_lock_collaterals,
-            locked_and_expired_collaterals,
-            total_program_cycles,
-            total_cycles,
         ) = tokio::join!(
             self.db.get_period_fulfilled_count(period_start, period_end),
             self.db.get_period_unique_provers(period_start, period_end),
@@ -305,11 +308,29 @@ where
             self.db.get_period_total_requests_submitted(period_start, period_end),
             self.db.get_period_total_requests_submitted_onchain(period_start, period_end),
             self.db.get_period_total_requests_locked(period_start, period_end),
+        );
+
+        let (
+            total_requests_slashed,
+            total_expired,
+            total_locked_and_expired,
+            total_locked_and_fulfilled,
+            total_secondary_fulfillments,
+        ) = tokio::join!(
             self.db.get_period_total_requests_slashed(period_start, period_end),
             self.db.get_period_expired_count(period_start, period_end),
             self.db.get_period_locked_and_expired_count(period_start, period_end),
             self.db.get_period_locked_and_fulfilled_count(period_start, period_end),
             self.db.get_period_secondary_fulfillments_count(period_start, period_end),
+        );
+
+        let (
+            locks,
+            all_lock_collaterals,
+            locked_and_expired_collaterals,
+            total_program_cycles,
+            total_cycles,
+        ) = tokio::join!(
             self.db.get_period_lock_pricing_data(period_start, period_end),
             self.db.get_period_all_lock_collateral(period_start, period_end),
             self.db.get_period_locked_and_expired_collateral(period_start, period_end),
@@ -349,6 +370,7 @@ where
         // Compute fees and per-cycle pricing percentiles from fulfilled requests only
         // (where lock_prover_address == fulfill_prover_address)
         let mut total_fees = U256::ZERO;
+        let mut total_fixed_cost = U256::ZERO;
         let mut prices_per_cycle: Vec<alloy::primitives::Uint<256, 4>> = Vec::new();
 
         for lock in locks {
@@ -387,6 +409,12 @@ where
 
             total_fees += price;
 
+            if let Some(fixed_cost_str) = &lock.fixed_cost {
+                if let Ok(fc) = U256::from_str(fixed_cost_str) {
+                    total_fixed_cost += fc;
+                }
+            }
+
             // Use precomputed lock_price_per_cycle if available
             if let Some(price_per_cycle_str) = &lock.lock_price_per_cycle {
                 if let Ok(price_per_cycle) = U256::from_str(price_per_cycle_str) {
@@ -394,6 +422,9 @@ where
                 }
             }
         }
+
+        let total_variable_cost =
+            if total_fees > total_fixed_cost { total_fees - total_fixed_cost } else { U256::ZERO };
 
         // Compute total collateral from all locked requests (regardless of fulfillment)
         let mut total_collateral = U256::ZERO;
@@ -413,12 +444,12 @@ where
             total_locked_and_expired_collateral += lock_collateral;
         }
 
-        // Compute percentiles: p10, p25, p50, p75, p90, p95, p99
+        // Compute percentiles: p5, p10, p25, p50, p75, p90, p95, p99
         let percentiles = if !prices_per_cycle.is_empty() {
             let mut sorted_prices = prices_per_cycle;
-            compute_percentiles(&mut sorted_prices, &[10, 25, 50, 75, 90, 95, 99])
+            compute_percentiles(&mut sorted_prices, &[5, 10, 25, 50, 75, 90, 95, 99])
         } else {
-            vec![U256::ZERO; 7]
+            vec![U256::ZERO; 8]
         };
 
         // TODO: Populate best prover metrics from fulfilled requests
@@ -429,21 +460,26 @@ where
         let best_effective_prove_mhz_prover = None;
         let best_effective_prove_mhz_request_id = None;
 
+        let epoch_number_period_start =
+            self.epoch_calculator.get_epoch_for_timestamp(period_start).unwrap_or(0) as i64;
+
         Ok(PeriodMarketSummary {
             period_timestamp: period_start,
+            epoch_number_period_start,
             total_fulfilled,
             unique_provers_locking_requests: unique_provers,
             unique_requesters_submitting_requests: unique_requesters,
             total_fees_locked: total_fees,
             total_collateral_locked: total_collateral,
             total_locked_and_expired_collateral,
-            p10_lock_price_per_cycle: percentiles[0],
-            p25_lock_price_per_cycle: percentiles[1],
-            p50_lock_price_per_cycle: percentiles[2],
-            p75_lock_price_per_cycle: percentiles[3],
-            p90_lock_price_per_cycle: percentiles[4],
-            p95_lock_price_per_cycle: percentiles[5],
-            p99_lock_price_per_cycle: percentiles[6],
+            p5_lock_price_per_cycle: percentiles[0],
+            p10_lock_price_per_cycle: percentiles[1],
+            p25_lock_price_per_cycle: percentiles[2],
+            p50_lock_price_per_cycle: percentiles[3],
+            p75_lock_price_per_cycle: percentiles[4],
+            p90_lock_price_per_cycle: percentiles[5],
+            p95_lock_price_per_cycle: percentiles[6],
+            p99_lock_price_per_cycle: percentiles[7],
             total_requests_submitted,
             total_requests_submitted_onchain,
             total_requests_submitted_offchain,
@@ -456,6 +492,8 @@ where
             locked_orders_fulfillment_rate,
             total_program_cycles,
             total_cycles,
+            total_fixed_cost,
+            total_variable_cost,
             best_peak_prove_mhz,
             best_peak_prove_mhz_prover,
             best_peak_prove_mhz_request_id,
@@ -491,11 +529,13 @@ pub fn sum_hourly_aggregates_into_base(
         base.total_cycles += hourly.total_cycles;
     }
 
-    // Sum U256 fields (fees, collateral)
+    // Sum U256 fields (fees, collateral, costs)
     for hourly in hourly_summaries {
         base.total_fees_locked += hourly.total_fees_locked;
         base.total_collateral_locked += hourly.total_collateral_locked;
         base.total_locked_and_expired_collateral += hourly.total_locked_and_expired_collateral;
+        base.total_fixed_cost += hourly.total_fixed_cost;
+        base.total_variable_cost += hourly.total_variable_cost;
     }
 
     // Find best metrics (maximum mhz)
@@ -642,6 +682,10 @@ where
                 );
                     AllTimeMarketSummary {
                         period_timestamp: base_timestamp,
+                        epoch_number_period_start: self
+                            .epoch_calculator
+                            .get_epoch_for_timestamp(base_timestamp)
+                            .unwrap_or(0) as i64,
                         total_fulfilled: 0,
                         unique_provers_locking_requests: 0,
                         unique_requesters_submitting_requests: 0,
@@ -660,6 +704,8 @@ where
                         locked_orders_fulfillment_rate: 0.0,
                         total_program_cycles: U256::ZERO,
                         total_cycles: U256::ZERO,
+                        total_fixed_cost: U256::ZERO,
+                        total_variable_cost: U256::ZERO,
                         best_peak_prove_mhz: 0.0,
                         best_peak_prove_mhz_prover: None,
                         best_peak_prove_mhz_request_id: None,
@@ -698,8 +744,10 @@ where
                 );
             }
 
-            // Update period_timestamp to reflect this hour
+            // Update period_timestamp and epoch_number_period_start to reflect this hour
             cumulative_summary.period_timestamp = hour_ts;
+            cumulative_summary.epoch_number_period_start =
+                self.epoch_calculator.get_epoch_for_timestamp(hour_ts).unwrap_or(0) as i64;
 
             // Query unique counts from DB for all data up to this hour
             cumulative_summary.unique_provers_locking_requests =
@@ -713,6 +761,91 @@ where
         }
 
         tracing::info!("aggregate_all_time_market_data_from completed in {:?}", start.elapsed());
+        Ok(())
+    }
+
+    /// Aggregate epoch-based market data
+    pub(crate) async fn aggregate_epoch_market_data(
+        &self,
+        to_block: u64,
+    ) -> Result<(), ServiceError> {
+        let current_time = self.block_timestamp(to_block).await?;
+        let Some(current_epoch) = self.epoch_calculator.get_epoch_for_timestamp(current_time)
+        else {
+            tracing::debug!(
+                "Current time {} is before epoch 0, skipping epoch market aggregation",
+                current_time
+            );
+            return Ok(());
+        };
+
+        tracing::debug!(
+            "Aggregating epoch market data up to epoch {} (current_time: {})",
+            current_epoch,
+            current_time
+        );
+
+        let start_epoch = current_epoch.saturating_sub(EPOCH_AGGREGATION_RECOMPUTE_COUNT);
+
+        for epoch_num in start_epoch..=current_epoch {
+            let boundary = self.epoch_calculator.get_epoch_boundary(epoch_num);
+            self.aggregate_epoch_market_data_for_epoch(
+                epoch_num,
+                boundary.start_time,
+                boundary.end_time,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Aggregate epoch-based market data for a time range (used by backfill)
+    pub(crate) async fn aggregate_epoch_market_data_from(
+        &self,
+        from_time: u64,
+        to_time: u64,
+    ) -> Result<(), ServiceError> {
+        let start = std::time::Instant::now();
+
+        for boundary in self.epoch_calculator.iter_epochs(from_time, to_time) {
+            self.aggregate_epoch_market_data_for_epoch(
+                boundary.epoch_number,
+                boundary.start_time,
+                boundary.end_time,
+            )
+            .await?;
+        }
+
+        tracing::debug!(
+            "aggregate_epoch_market_data_from {} to {} completed in {:?}",
+            from_time,
+            to_time,
+            start.elapsed()
+        );
+
+        Ok(())
+    }
+
+    async fn aggregate_epoch_market_data_for_epoch(
+        &self,
+        epoch_num: u64,
+        start_time: u64,
+        end_time: u64,
+    ) -> Result<(), ServiceError> {
+        let start = std::time::Instant::now();
+
+        // period_end is exclusive, so add 1 to end_time (which is inclusive)
+        let summary = self.compute_period_summary(start_time, end_time + 1).await?;
+        // period_timestamp already contains start_time from compute_period_summary
+
+        self.db
+            .upsert_epoch_market_summary(summary)
+            .await
+            .with_db_context("upsert_epoch_market_summary")?;
+
+        tracing::debug!("Aggregated epoch {} market data in {:?}", epoch_num, start.elapsed());
+
         Ok(())
     }
 }

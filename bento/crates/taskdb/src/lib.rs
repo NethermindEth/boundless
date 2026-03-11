@@ -131,6 +131,49 @@ pub async fn create_stream(
     .ok_or(TaskDbErr::InternalErr("create_stream result missing id field".into()))
 }
 
+pub async fn get_or_create_stream(
+    pool: &PgPool,
+    worker_type: &str,
+    reserved: i32,
+    be_mult: f32,
+    user_id: &str,
+) -> Result<Uuid, TaskDbErr> {
+    if be_mult == 0.0 {
+        return Err(TaskDbErr::InvalidBeMult);
+    }
+
+    let mut txn = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind(worker_type)
+        .bind(user_id)
+        .execute(&mut *txn)
+        .await?;
+
+    if let Some(existing_stream) = sqlx::query_scalar(
+        "SELECT id FROM streams WHERE user_id = $1 AND worker_type = $2 ORDER BY id LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(worker_type)
+    .fetch_optional(&mut *txn)
+    .await?
+    {
+        txn.commit().await?;
+        return Ok(existing_stream);
+    }
+
+    let stream_id = sqlx::query_scalar("SELECT create_stream($1, $2, $3, $4)")
+        .bind(worker_type)
+        .bind(reserved)
+        .bind(be_mult)
+        .bind(user_id)
+        .fetch_one(&mut *txn)
+        .await?;
+
+    txn.commit().await?;
+    Ok(stream_id)
+}
+
 pub async fn create_job(
     pool: &PgPool,
     stream_id: &Uuid,
@@ -607,6 +650,41 @@ mod tests {
     }
 
     #[sqlx::test()]
+    async fn get_or_create_stream_is_idempotent_under_contention(pool: PgPool) -> sqlx::Result<()> {
+        let worker_type = "executor".to_string();
+        let user_id = "user1".to_string();
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let pool = pool.clone();
+            let worker_type = worker_type.clone();
+            let user_id = user_id.clone();
+            join_set.spawn(async move {
+                get_or_create_stream(&pool, &worker_type, 1, 1.0, &user_id).await.unwrap()
+            });
+        }
+
+        let mut stream_ids = Vec::new();
+        while let Some(join_res) = join_set.join_next().await {
+            stream_ids.push(join_res.unwrap());
+        }
+
+        let first_stream = stream_ids[0];
+        assert!(stream_ids.iter().all(|stream_id| *stream_id == first_stream));
+
+        let stream_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM streams WHERE user_id = $1 AND worker_type = $2",
+        )
+        .bind(&user_id)
+        .bind(&worker_type)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(stream_count, 1);
+
+        Ok(())
+    }
+
+    #[sqlx::test()]
     async fn create_job_test(pool: PgPool) -> sqlx::Result<()> {
         let user_id = "user1";
         let task_def = serde_json::json!({"member": "data"});
@@ -971,8 +1049,10 @@ mod tests {
         let job_id_1 =
             create_job(&pool, &stream_id_1, &JsonValue::default(), 0, 100, user_id).await.unwrap();
 
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_1);
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_0);
 
@@ -1003,6 +1083,7 @@ mod tests {
         .unwrap();
         // starts 'running' a task from each to get the system out of round robin stream selection
         // and into best effort.
+        refresh_stream_counters(&pool).await.unwrap();
         let _task = request_work(&pool, worker_type).await.unwrap().unwrap();
 
         let stream_id_1 = create_stream(&pool, worker_type, 0, 1.1, user_id).await.unwrap();
@@ -1020,11 +1101,14 @@ mod tests {
         )
         .await
         .unwrap();
+        refresh_stream_counters(&pool).await.unwrap();
         let _task = request_work(&pool, worker_type).await.unwrap().unwrap();
 
         // validate that the higher be_mult stream is emitted first.
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_1);
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_0);
 
@@ -1071,6 +1155,7 @@ mod tests {
         // - stream_2, task
         // - HIT PEAK of stream2 reservations
         // - stream_0, init
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_2);
         assert_eq!(task.task_id, INIT_TASK);
@@ -1080,6 +1165,7 @@ mod tests {
                 .unwrap()
         );
 
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_2);
         assert_eq!(task.task_id, task_name);
@@ -1089,6 +1175,7 @@ mod tests {
                 .unwrap()
         );
 
+        refresh_stream_counters(&pool).await.unwrap();
         let task = request_work(&pool, worker_type).await.unwrap().unwrap();
         assert_eq!(task.job_id, job_id_0);
         assert_eq!(task.task_id, INIT_TASK);
@@ -1098,6 +1185,7 @@ mod tests {
                 .unwrap()
         );
 
+        refresh_stream_counters(&pool).await.unwrap();
         assert!(request_work(&pool, worker_type).await.unwrap().is_none());
 
         Ok(())
@@ -1369,8 +1457,9 @@ async fn delete_job_test(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// Run AUX maintenance to recalculate stream priorities and counters
-pub async fn maint_streams(pool: &PgPool) -> Result<(), TaskDbErr> {
-    sqlx::query("SELECT maint_streams()").execute(pool).await?;
+/// Bulk refresh stream ready/running counters from actual task counts.
+/// Called periodically by aux workers (e.g. every 1–2s) instead of per-row triggers.
+pub async fn refresh_stream_counters(pool: &PgPool) -> Result<(), TaskDbErr> {
+    sqlx::query("SELECT refresh_stream_counters()").execute(pool).await?;
     Ok(())
 }

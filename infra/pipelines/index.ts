@@ -5,12 +5,9 @@ import { LDistributorPipeline } from "./pipelines/l-distributor";
 import { LIndexerPipeline } from "./pipelines/l-indexer";
 import { LOrderGeneratorPipeline } from "./pipelines/l-order-generator";
 import { LOrderStreamPipeline } from "./pipelines/l-order-stream";
-import { LProverPipeline } from "./pipelines/l-prover";
+import { LProverAnsiblePipeline } from "./pipelines/l-prover-ansible";
 import { LRequestorListsPipeline } from "./pipelines/l-requestor-lists";
 import { LSlasherPipeline } from "./pipelines/l-slasher";
-import { PackerPipeline } from "./pipelines/packer";
-import { ProverClusterPipeline } from "./pipelines/prover-cluster";
-import { PackerNightlyPipeline } from "./pipelines/packer-nightly";
 import { CodePipelineSharedResources } from "./components/codePipelineResources";
 import * as aws from "@pulumi/aws";
 import {
@@ -26,7 +23,18 @@ import {
 } from "./accountConstants";
 import * as pulumi from '@pulumi/pulumi';
 
+// Shared pipeline resources (role, artifact bucket) must exist before PulumiStateBucket so the
+// pipeline role can be granted access to the state bucket and KMS key (for CodeBuild pulumi login).
+const codePipelineSharedResources = new CodePipelineSharedResources("codePipelineShared", {
+  accountId: BOUNDLESS_OPS_ACCOUNT_ID,
+  serviceAccountDeploymentRoleArns: [
+    BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN,
+    BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN,
+  ],
+});
+
 // Defines the S3 bucket used for storing the Pulumi state backend for staging and prod accounts.
+// The ops pipeline role is included so CodeBuild can run `pulumi login` / `pulumi destroy` before assuming cross-account roles.
 const pulumiStateBucket = new PulumiStateBucket("pulumiStateBucket", {
   accountId: BOUNDLESS_OPS_ACCOUNT_ID,
   readOnlyStateBucketArns: [
@@ -37,13 +45,14 @@ const pulumiStateBucket = new PulumiStateBucket("pulumiStateBucket", {
     BOUNDLESS_PROD_ADMIN_ROLE_ARN,
     BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN,
     BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN,
+    codePipelineSharedResources.role.arn,
   ],
 });
 
 // Defines the KMS key used to encrypt and decrypt secrets.
 // Currently, developers logged in as Admin in the Boundless Dev account can encrypt and decrypt secrets.
 // TODO: Only deployment roles should be allowed to decrypt secrets.
-// Staging and prod deployement roles are the only accounts allowed to decrypt secrets.
+// Staging and prod deployment roles plus the ops pipeline role (for CodeBuild) can decrypt secrets.
 const pulumiSecrets = new PulumiSecrets("pulumiSecrets", {
   accountId: BOUNDLESS_OPS_ACCOUNT_ID,
   encryptKmsKeyArns: [
@@ -53,6 +62,7 @@ const pulumiSecrets = new PulumiSecrets("pulumiSecrets", {
     BOUNDLESS_DEV_ADMIN_ROLE_ARN,
     BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN,
     BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN,
+    codePipelineSharedResources.role.arn,
   ],
 });
 
@@ -63,15 +73,6 @@ const pulumiSecrets = new PulumiSecrets("pulumiSecrets", {
 const githubConnection = new aws.codestarconnections.Connection("boundlessGithubConnection", {
   name: "boundlessGithubConnection",
   providerType: "GitHub",
-});
-
-// Resouces that are shared between all deployment pipelines like IAM roles, S3 artifact buckets, etc.
-const codePipelineSharedResources = new CodePipelineSharedResources("codePipelineShared", {
-  accountId: BOUNDLESS_OPS_ACCOUNT_ID,
-  serviceAccountDeploymentRoleArns: [
-    BOUNDLESS_STAGING_DEPLOYMENT_ROLE_ARN,
-    BOUNDLESS_PROD_DEPLOYMENT_ROLE_ARN,
-  ],
 });
 
 const config = new pulumi.Config();
@@ -127,16 +128,6 @@ const lOrderStreamPipeline = new LOrderStreamPipeline("lOrderStreamPipeline", {
   slackAlertsTopicArn: notifications.slackSNSTopicLaunch.arn,
 })
 
-const lProverPipeline = new LProverPipeline("lProverPipeline", {
-  connection: githubConnection,
-  artifactBucket: codePipelineSharedResources.artifactBucket,
-  role: codePipelineSharedResources.role,
-  githubToken,
-  dockerUsername,
-  dockerToken,
-  slackAlertsTopicArn: notifications.slackSNSTopicLaunch.arn,
-})
-
 const lOrderGeneratorPipeline = new LOrderGeneratorPipeline("lOrderGeneratorPipeline", {
   connection: githubConnection,
   artifactBucket: codePipelineSharedResources.artifactBucket,
@@ -177,61 +168,22 @@ const lRequestorListsPipeline = new LRequestorListsPipeline("lRequestorListsPipe
   slackAlertsTopicArn: notifications.slackSNSTopicLaunch.arn,
 })
 
-// Packer AMI build pipeline
-const packerPipeline = new PackerPipeline("packerPipeline", {
+// Prover Ansible deployment (SSH + inventory in Secrets Manager; no infra in GitHub)
+const lProverAnsiblePipeline = new LProverAnsiblePipeline("lProverAnsiblePipeline", {
   connection: githubConnection,
   artifactBucket: codePipelineSharedResources.artifactBucket,
   role: codePipelineSharedResources.role,
-  opsAccountId: BOUNDLESS_OPS_ACCOUNT_ID,
-  serviceAccountIds: {
-    development: BOUNDLESS_DEV_ACCOUNT_ID,
-    staging: BOUNDLESS_STAGING_ACCOUNT_ID,
-    production: BOUNDLESS_PROD_ACCOUNT_ID,
-  },
   githubToken,
   dockerUsername,
   dockerToken,
   slackAlertsTopicArn: notifications.slackSNSTopicLaunch.arn,
-});
-
-// Prover cluster deployment pipelines
-const proverClusterPipeline = new ProverClusterPipeline("proverClusterPipeline", {
-  connection: githubConnection,
-  artifactBucket: codePipelineSharedResources.artifactBucket,
-  role: codePipelineSharedResources.role,
-  stagingAccountId: BOUNDLESS_STAGING_ACCOUNT_ID,
-  productionAccountId: BOUNDLESS_PROD_ACCOUNT_ID,
-  opsAccountId: BOUNDLESS_OPS_ACCOUNT_ID,
-  githubToken,
-  dockerUsername,
-  dockerToken,
-  slackAlertsTopicArn: notifications.slackSNSTopicLaunch.arn,
-});
-
-// Nightly build pipeline
-const packerNightlyPipeline = new PackerNightlyPipeline("packerNightlyPipeline", {
-  connection: githubConnection,
-  artifactBucket: codePipelineSharedResources.artifactBucket,
-  role: codePipelineSharedResources.role,
-  opsAccountId: BOUNDLESS_OPS_ACCOUNT_ID,
-  serviceAccountIds: {
-    development: BOUNDLESS_DEV_ACCOUNT_ID,
-    staging: BOUNDLESS_STAGING_ACCOUNT_ID,
-    production: BOUNDLESS_PROD_ACCOUNT_ID,
-  },
-  githubToken,
-  dockerUsername,
-  dockerToken,
-  slackAlertsTopicArn: notifications.slackSNSTopicLaunch.arn,
-});
-
+})
 
 export const bucketName = pulumiStateBucket.bucket.id;
+export const sccacheBucketName = codePipelineSharedResources.sccacheBucket.id;
 export const kmsKeyArn = pulumiSecrets.kmsKey.arn;
 export const boundlessAlertsBetaTopicArn = notifications.slackSNSTopic.arn;
 export const boundlessPagerdutyBetaTopicArn = notifications.pagerdutySNSTopic.arn;
 export const boundlessAlertsTopicArnLaunch = notifications.slackSNSTopicLaunch.arn;
 export const boundlessAlertsTopicArnStagingLaunch = notifications.slackSNSTopicStagingLaunch.arn;
-export const packerPipelineName = packerPipeline.pipelineName;
-export const proverClusterStagingPipelineName = proverClusterPipeline.pipelineName;
-export const packerNightlyPipelineName = packerNightlyPipeline.pipelineName;
+export const lProverAnsiblePipelineName = lProverAnsiblePipeline.pipelineName;

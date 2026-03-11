@@ -4,6 +4,7 @@ import * as awsx from '@pulumi/awsx';
 import * as docker_build from '@pulumi/docker-build';
 import * as pulumi from '@pulumi/pulumi';
 import { IndexerShared } from './indexer-infra';
+import { Severity } from '../../util';
 
 export interface RewardsIndexerArgs {
   infra: IndexerShared;
@@ -22,6 +23,9 @@ export interface RewardsIndexerArgs {
 }
 
 export class RewardsIndexer extends pulumi.ComponentResource {
+  public readonly image: docker_build.Image;
+  public readonly service: awsx.ecs.FargateService;
+
   constructor(name: string, args: RewardsIndexerArgs, opts?: pulumi.ComponentResourceOptions) {
     super('indexer:rewards', name, opts);
 
@@ -57,7 +61,7 @@ export class RewardsIndexer extends pulumi.ComponentResource {
       };
     }
 
-    const rewardsImage = new docker_build.Image(`${serviceName}-rewards-img`, {
+    this.image = new docker_build.Image(`${serviceName}-rewards-img`, {
       tags: [pulumi.interpolate`${infra.ecrRepository.repository.repositoryUrl}:rewards-${dockerTag}`],
       context: {
         location: dockerDir,
@@ -104,7 +108,7 @@ export class RewardsIndexer extends pulumi.ComponentResource {
 
     const rewardsServiceLogGroup = `${serviceName}-rewards-service-v2`;
 
-    const rewardsService = new awsx.ecs.FargateService(`${serviceName}-rewards-service`, {
+    this.service = new awsx.ecs.FargateService(`${serviceName}-rewards-service`, {
       name: `${serviceName}-rewards-service`,
       cluster: infra.cluster.arn,
       networkConfiguration: {
@@ -131,7 +135,7 @@ export class RewardsIndexer extends pulumi.ComponentResource {
         taskRole: { roleArn: infra.taskRole.arn },
         container: {
           name: `${serviceName}-rewards`,
-          image: rewardsImage.ref,
+          image: this.image.ref,
           cpu: 512,
           memory: 256,
           essential: true,
@@ -202,63 +206,65 @@ export class RewardsIndexer extends pulumi.ComponentResource {
 
     const alarmActions = boundlessAlertsTopicArns ?? [];
 
+    const errorLogMetricName = `${serviceName}-rewards-log-err`;
     new aws.cloudwatch.LogMetricFilter(`${serviceName}-rewards-log-err-filter`, {
       name: `${serviceName}-rewards-log-err-filter`,
       logGroupName: rewardsServiceLogGroup,
       metricTransformation: {
         namespace: serviceMetricsNamespace,
-        name: `${serviceName}-rewards-log-err`,
+        name: errorLogMetricName,
         value: '1',
         defaultValue: '0',
       },
       pattern: `"ERROR "`,
-    }, { parent: this, dependsOn: [rewardsService] });
+    }, { parent: this, dependsOn: [this.service] });
 
-    new aws.cloudwatch.MetricAlarm(`${serviceName}-rewards-error-alarm`, {
-      name: `${serviceName}-rewards-log-err`,
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-rewards-error-alarm-${Severity.SEV2}`, {
+      name: `${serviceName}-rewards-log-err-${Severity.SEV2}`,
       metricQueries: [
         {
           id: 'm1',
           metric: {
             namespace: serviceMetricsNamespace,
-            metricName: `${serviceName}-rewards-log-err`,
-            period: 60,
+            metricName: errorLogMetricName,
+            period: 300,
             stat: 'Sum',
           },
           returnData: true,
         },
       ],
-      threshold: 1,
+      threshold: 2,
       comparisonOperator: 'GreaterThanOrEqualToThreshold',
-      evaluationPeriods: 60,
+      evaluationPeriods: 12,
       datapointsToAlarm: 2,
       treatMissingData: 'notBreaching',
-      alarmDescription: 'Rewards indexer log ERROR level',
+      alarmDescription: `Rewards indexer ${name}: 2 periods with ERROR logs within 1 hour ${Severity.SEV2}`,
       actionsEnabled: true,
       alarmActions,
     }, { parent: this });
 
+    const fatalLogMetricName = `${serviceName}-rewards-log-fatal`;
     new aws.cloudwatch.LogMetricFilter(`${serviceName}-rewards-log-fatal-filter`, {
       name: `${serviceName}-rewards-log-fatal-filter`,
       logGroupName: rewardsServiceLogGroup,
       metricTransformation: {
         namespace: serviceMetricsNamespace,
-        name: `${serviceName}-rewards-log-fatal`,
+        name: fatalLogMetricName,
         value: '1',
         defaultValue: '0',
       },
       pattern: 'FATAL',
-    }, { parent: this, dependsOn: [rewardsService] });
+    }, { parent: this, dependsOn: [this.service] });
 
-    new aws.cloudwatch.MetricAlarm(`${serviceName}-rewards-fatal-alarm`, {
-      name: `${serviceName}-rewards-log-fatal`,
+    new aws.cloudwatch.MetricAlarm(`${serviceName}-rewards-fatal-alarm-${Severity.SEV2}`, {
+      name: `${serviceName}-rewards-log-fatal-${Severity.SEV2}`,
       metricQueries: [
         {
           id: 'm1',
           metric: {
             namespace: serviceMetricsNamespace,
-            metricName: `${serviceName}-rewards-log-fatal`,
-            period: 60,
+            metricName: fatalLogMetricName,
+            period: 300,
             stat: 'Sum',
           },
           returnData: true,
@@ -266,14 +272,17 @@ export class RewardsIndexer extends pulumi.ComponentResource {
       ],
       threshold: 1,
       comparisonOperator: 'GreaterThanOrEqualToThreshold',
-      evaluationPeriods: 1,
-      datapointsToAlarm: 1,
+      evaluationPeriods: 12,
+      datapointsToAlarm: 2,
       treatMissingData: 'notBreaching',
-      alarmDescription: `Rewards indexer ${name} FATAL (task exited)`,
+      alarmDescription: `Rewards indexer ${name} FATAL 2 periods with ERROR logs within 1 hour ${Severity.SEV2}`,
       actionsEnabled: true,
       alarmActions,
     }, { parent: this });
 
-    this.registerOutputs({});
+    this.registerOutputs({
+      imageRef: this.image.ref,
+      serviceUrn: this.service.urn,
+    });
   }
 }

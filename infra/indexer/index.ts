@@ -3,6 +3,7 @@ import { IndexerShared } from './components/indexer-infra';
 import { MarketIndexer } from './components/market-indexer';
 import { RewardsIndexer } from './components/rewards-indexer';
 import { MonitorLambda } from './components/monitor-lambda';
+import { RedriveLambda } from './components/redrive-lambda';
 import { IndexerApi } from './components/indexer-api';
 import { getEnvVar, getServiceNameV1 } from '../util';
 
@@ -55,6 +56,7 @@ export = () => {
   const povwAccountingAddress = config.get('POVW_ACCOUNTING_ADDRESS');
   const indexerApiDomain = config.get('INDEXER_API_DOMAIN');
   const allowedIpAddresses = config.getSecret('ALLOWED_IP_ADDRESSES');
+  const premiumApiKey = config.getSecret('PREMIUM_API_KEY');
 
   const shouldDeployMarket = !!boundlessAddress && !!startBlock;
   const shouldDeployRewards = !!vezkcAddress && !!zkcAddress && !!povwAccountingAddress;
@@ -68,6 +70,7 @@ export = () => {
     vpcId,
     privSubNetIds,
     rdsPassword,
+    isDev,
   });
 
   let marketIndexer: MarketIndexer | undefined;
@@ -75,8 +78,25 @@ export = () => {
     const logsEthRpcUrl = isDev ? pulumi.output(getEnvVar("LOGS_ETH_RPC_URL")) : config.requireSecret('LOGS_ETH_RPC_URL');
     const orderStreamApiKey = isDev ? pulumi.output(getEnvVar("ORDER_STREAM_API_KEY")) : config.requireSecret('ORDER_STREAM_API_KEY');
     const orderStreamUrl = isDev ? pulumi.output(getEnvVar("ORDER_STREAM_URL")) : config.getSecret('ORDER_STREAM_URL');
-    const bentoApiUrl = isDev ? pulumi.output(process.env.BENTO_API_URL || '') : config.getSecret('BENTO_API_URL');
-    const bentoApiKey = isDev ? pulumi.output(process.env.BENTO_API_KEY || '') : config.getSecret('BENTO_API_KEY');
+
+    let bentoApiUrl: pulumi.Output<string> | undefined;
+    let bentoApiKey: pulumi.Output<string> | undefined;
+    if (isDev) {
+      if (process.env.BENTO_API_URL) {
+        bentoApiUrl = pulumi.output(process.env.BENTO_API_URL);
+      }
+      if (process.env.BENTO_API_KEY) {
+        bentoApiKey = pulumi.output(process.env.BENTO_API_KEY);
+      }
+    } else {
+      bentoApiUrl = config.getSecret('BENTO_API_URL');
+      bentoApiKey = config.getSecret('BENTO_API_KEY');
+    }
+
+    const blockDelay = config.get('BLOCK_DELAY') || "0";
+    const backfillChainDataBlocks = config.get('BACKFILL_CHAIN_DATA_BLOCKS');
+    const chainDataBatchDelayMs = config.get('CHAIN_DATA_BATCH_DELAY_MS') || '1000';
+    const backfillBatchSize = config.get('BACKFILL_BATCH_SIZE') || '750';
 
     marketIndexer = new MarketIndexer(indexerServiceName, {
       infra,
@@ -97,6 +117,10 @@ export = () => {
       bentoApiUrl,
       bentoApiKey,
       rustLogLevel: rustLogIndexer,
+      blockDelay,
+      backfillChainDataBlocks,
+      chainDataBatchDelayMs,
+      backfillBatchSize,
     }, { parent: infra, dependsOn: [infra, infra.cacheBucket, infra.dbUrlSecret, infra.dbUrlSecretVersion, infra.dbReaderUrlSecret, infra.dbReaderUrlSecretVersion] });
   }
 
@@ -121,10 +145,10 @@ export = () => {
 
   const sharedDependencies: pulumi.Resource[] = [infra.dbUrlSecret, infra.dbUrlSecretVersion, infra.dbReaderUrlSecret, infra.dbReaderUrlSecretVersion];
   if (marketIndexer) {
-    sharedDependencies.push(marketIndexer);
+    sharedDependencies.push(marketIndexer.image, marketIndexer.service);
   }
   if (rewardsIndexer) {
-    sharedDependencies.push(rewardsIndexer);
+    sharedDependencies.push(rewardsIndexer.image, rewardsIndexer.service);
   }
 
   if (shouldDeployMarket && marketIndexer) {
@@ -140,6 +164,13 @@ export = () => {
       boundlessAlertsTopicArns: alertsTopicArns,
       serviceMetricsNamespace,
       marketMetricsNamespace,
+    }, { parent: infra, dependsOn: sharedDependencies });
+
+    new RedriveLambda(indexerServiceName, {
+      privSubNetIds: privSubNetIds,
+      dbUrlSecret: infra.dbUrlSecret,
+      indexerSgId: infra.indexerSecurityGroup.id,
+      rustLogLevel: rustLogIndexer,
     }, { parent: infra, dependsOn: sharedDependencies });
   }
 
@@ -159,6 +190,7 @@ export = () => {
       databaseVersion: infra.databaseVersion,
       proxySecret,
       allowedIpAddresses,
+      premiumApiKey,
     }, { parent: infra, dependsOn: sharedDependencies });
   }
 

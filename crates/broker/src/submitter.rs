@@ -528,7 +528,8 @@ where
 
             // If we expect a stake reward, check if we won the proof race to be the first secondary prover.
             if order_price.collateral_reward > U256::ZERO {
-                let prover = self.market.get_request_fulfillment_prover(fulfillment.id).await;
+                let prover =
+                    self.market.get_request_fulfillment_prover(fulfillment.id, None, None).await;
                 if let Ok(prover) = prover {
                     if prover != self.prover_address {
                         collateral_reward_log = format!("collateral_reward: 0 (lost secondary prover race to {prover} for {collateral_reward})");
@@ -928,6 +929,7 @@ mod tests {
             boundless_market_address: market_address,
             chain_id,
             total_cycles: None,
+            journal_bytes: None,
             proving_started_at: None,
             cached_id: Default::default(),
         };

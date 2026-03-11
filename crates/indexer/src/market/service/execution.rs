@@ -20,14 +20,30 @@ use crate::market::service::IndexerServiceExecutionConfig;
 use alloy::primitives::{B256, U256};
 use anyhow::{anyhow, Result};
 use bonsai_sdk::non_blocking::{Client as BonsaiClient, SessionId};
-use boundless_market::storage::fetch_url;
+use boundless_market::storage::StorageDownloader;
+use boundless_market::{StandardDownloader, StorageDownloaderConfig};
 use broker::futures_retry::retry;
 use bytes::Bytes;
+use moka::future::Cache;
+use moka::policy::EvictionPolicy;
 use std::collections::{HashMap, HashSet};
+
+/// Max number of (image_url -> image_id) entries to keep for reuse.
+const IMAGE_CACHE_MAX_ENTRIES: u64 = 256;
+
+/// Max length for error strings stored in the DB.
+const MAX_ERROR_LENGTH: usize = 100;
+
+/// Type for the image URL -> image_id cache.
+type ImageCache = Cache<String, String>;
 
 /// Format an optional request ID for logging
 fn fmt_request_id(id: Option<U256>) -> String {
     id.map(|i| format!("0x{:x}", i)).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn truncate(s: String) -> String {
+    s.chars().take(MAX_ERROR_LENGTH).collect()
 }
 
 pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) {
@@ -40,6 +56,9 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
     tracing::debug!("  bento_retry_sleep_ms: {}", config.bento_retry_sleep_ms);
     tracing::debug!("  max_concurrent_executing: {}", config.max_concurrent_executing);
     tracing::debug!("  max_status_queries: {}", config.max_status_queries);
+    tracing::debug!("  max_retries: {}", config.max_retries);
+    tracing::debug!("  retry_base_delay_secs: {}", config.retry_base_delay_secs);
+    tracing::debug!("  retry_max_delay_secs: {}", config.retry_max_delay_secs);
 
     let mut interval = tokio::time::interval(config.execution_interval);
 
@@ -49,14 +68,19 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
         risc0_zkvm::VERSION,
     )
     .unwrap();
+    let downloader = downloader_from_config(&config).await;
 
+    let image_cache: ImageCache = Cache::builder()
+        .eviction_policy(EvictionPolicy::lru())
+        .max_capacity(IMAGE_CACHE_MAX_ENTRIES)
+        .build();
     let mut num_iterations: u32 = 1;
 
     loop {
         interval.tick().await;
 
         // Check on and log the current state of cycle counts
-        let (pending_count, executing_count, _failed_count) =
+        let (pending_count, executing_count, _failed_count, retry_pending_count) =
             match db.count_cycle_counts_by_status().await {
                 Ok(counts) => counts,
                 Err(e) => {
@@ -68,8 +92,9 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
             db.get_cycle_counts_executing(config.max_status_queries).await.unwrap();
 
         tracing::info!(
-            "Current cycle counts execution state: {} pending, {} executing [{}]",
+            "Current cycle counts execution state: {} pending, {} retry_pending, {} executing [{}]",
             pending_count,
+            retry_pending_count,
             executing_count,
             prev_executing_requests
                 .iter()
@@ -90,20 +115,24 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
             pending_to_process = config.max_concurrent_executing - executing_count;
         }
         if pending_to_process > 0 {
-            let pending_cycle_counts = match db.get_cycle_counts_pending(pending_to_process).await {
-                Ok(requests) => requests,
-                Err(e) => {
-                    tracing::error!("Unable to get cycle counts in status PENDING: {}", e);
-                    continue;
-                }
-            };
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let pending_cycle_counts =
+                match db.get_cycle_counts_pending(pending_to_process, now_secs).await {
+                    Ok(requests) => requests,
+                    Err(e) => {
+                        tracing::error!("Unable to get cycle counts in status PENDING: {}", e);
+                        continue;
+                    }
+                };
             requests_to_process.extend(pending_cycle_counts);
         }
 
-        // Build a map from request_digest to request_id for logging
+        // Build maps from request_digest for logging and retry logic
         let digest_to_request_id: HashMap<B256, Option<U256>> =
             requests_to_process.iter().map(|req| (req.request_digest, req.request_id)).collect();
-
         if !requests_to_process.is_empty() {
             tracing::debug!(
                 "About to request cycle counts for {} requests: {:?}",
@@ -134,6 +163,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
 
         let mut current_executing_requests = Vec::new();
         let mut failed_executions = Vec::new();
+        let mut retry_executions: Vec<(B256, String)> = Vec::new();
 
         for (request_digest, input_type, input_data, image_id, image_url, max_price) in
             request_inputs_and_images.clone()
@@ -142,26 +172,57 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
             let request_id = digest_to_request_id.get(&request_digest).copied().flatten();
 
             // Validate required fields are not empty
-            if image_id.is_empty() || input_type.is_empty() || input_data.is_empty() {
+            if input_type.is_empty() || input_data.is_empty() {
                 tracing::error!(
-                    "Cycle count request id={}, digest={:x} has empty required fields: image_id={}, input_type={}, input_data={}",
+                    "Cycle count request id={}, digest={:x} has empty required fields: input_type={}, input_data={}",
                     fmt_request_id(request_id),
                     request_digest,
-                    if image_id.is_empty() { "<empty>" } else { &image_id },
                     if input_type.is_empty() { "<empty>" } else { &input_type },
                     if input_data.is_empty() { "<empty>" } else { "<present>" }
                 );
                 failed_executions.push(request_digest);
                 continue;
             }
+            // When the predicate is of type ClaimDigestMatch, image_id is empty so we download the image to compute it.
+            let (image_id, downloaded_image) = match resolve_image_id(
+                &image_id,
+                &image_url,
+                &image_cache,
+                &downloader,
+            )
+            .await
+            {
+                Ok((id, maybe_image)) => {
+                    if maybe_image.is_some() {
+                        tracing::debug!(
+                            "Downloaded image for cycle count computation request id={}, digest={:x} from URL '{}'",
+                            fmt_request_id(request_id),
+                            request_digest,
+                            image_url
+                        );
+                    }
+                    (id, maybe_image)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to resolve image for cycle count computation request id={}, digest={:x} from URL '{}': {}",
+                        fmt_request_id(request_id),
+                        request_digest,
+                        image_url,
+                        e
+                    );
+                    retry_executions.push((request_digest, truncate(e.to_string())));
+                    continue;
+                }
+            };
 
             // Obtain the request input from either the URL or the inline data
             let input: Bytes = match download_or_decode_input(
-                &config,
                 request_id,
                 request_digest,
                 &input_type,
                 &input_data,
+                &downloader,
             )
             .await
             {
@@ -174,7 +235,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                             request_digest,
                             e
                         );
-                    failed_executions.push(request_digest);
+                    retry_executions.push((request_digest, truncate(e.to_string())));
                     continue;
                 }
             };
@@ -209,6 +270,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                         request_digest,
                         e
                     );
+                    retry_executions.push((request_digest, truncate(e.to_string())));
                     continue;
                 }
             };
@@ -218,6 +280,8 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                     fmt_request_id(request_id),
                     request_digest
                 );
+                retry_executions
+                    .push((request_digest, "Empty input UUID from Bento API".to_string()));
                 continue;
             }
 
@@ -252,11 +316,13 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                         request_digest,
                         e
                     );
+                    retry_executions.push((request_digest, truncate(e.to_string())));
                     continue;
                 }
             };
 
-            // If the image doesn't exist, download it from its URL and upload it via the bento API
+            // If the image doesn't exist, use already-downloaded bytes when available
+            // or download it from its URL, and upload it via the bento API.
             if !image_response {
                 tracing::trace!(
                     "Downloading image for cycle count computation request id={}, digest={:x} from URL '{}'",
@@ -265,21 +331,25 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                     image_url
                 );
 
-                let image: Vec<u8> = match retry(
-                    config.bento_retry_count,
-                    config.bento_retry_sleep_ms,
-                    || async { fetch_url(&image_url).await },
-                    "fetch_url",
-                )
-                .await
+                let has_downloaded_image = downloaded_image.is_some();
+                let image: Vec<u8> = match image_bytes(downloaded_image, &image_url, &downloader)
+                    .await
                 {
                     Ok(bytes) => {
-                        tracing::debug!(
-                            "Downloaded image for cycle count computation request id={}, digest={:x} from URL '{}'",
-                            fmt_request_id(request_id),
-                            request_digest,
-                            image_url
-                        );
+                        if has_downloaded_image {
+                            tracing::trace!(
+                                "Reusing already-downloaded image for cycle count computation request id={}, digest={:x}",
+                                fmt_request_id(request_id),
+                                request_digest
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Downloaded image for cycle count computation request id={}, digest={:x} from URL '{}'",
+                                fmt_request_id(request_id),
+                                request_digest,
+                                image_url
+                            );
+                        }
                         bytes
                     }
                     Err(e) => {
@@ -290,7 +360,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                             image_url,
                             e
                         );
-                        failed_executions.push(request_digest);
+                        retry_executions.push((request_digest, truncate(e.to_string())));
                         continue;
                     }
                 };
@@ -320,6 +390,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                             image_id,
                             e
                         );
+                        retry_executions.push((request_digest, truncate(e.to_string())));
                         continue;
                     }
                 };
@@ -368,6 +439,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                         request_digest,
                         e
                     );
+                    retry_executions.push((request_digest, truncate(e.to_string())));
                     continue;
                 }
             };
@@ -377,6 +449,8 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                     fmt_request_id(request_id),
                     request_digest
                 );
+                retry_executions
+                    .push((request_digest, "Empty session UUID from Bento API".to_string()));
                 continue;
             }
 
@@ -459,6 +533,7 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                         execution_info.session_uuid,
                         e
                     );
+                    retry_executions.push((execution_info.request_digest, truncate(e.to_string())));
                     continue;
                 }
             };
@@ -494,12 +569,15 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
                 }
                 _ => {
                     tracing::error!(
-                        "Cycle count status for request id={}, digest={:x} is not SUCCEEDED or RUNNING: {}. Marking as FAILED.",
+                        "Cycle count status for request id={}, digest={:x} is not SUCCEEDED or RUNNING: {}. Scheduling retry.",
                         fmt_request_id(execution_info.request_id),
                         execution_info.request_digest,
                         execution_status.status
                     );
-                    failed_executions.push(execution_info.request_digest);
+                    retry_executions.push((
+                        execution_info.request_digest,
+                        truncate(format!("Bento status: {}", execution_status.status)),
+                    ));
                 }
             }
         }
@@ -529,11 +607,53 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
             );
         }
 
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        let all_retry_counts: HashMap<B256, u32> = requests_to_process
+            .iter()
+            .map(|req| (req.request_digest, req.retry_count))
+            .chain(executing_requests.iter().map(|r| (r.request_digest, r.retry_count)))
+            .collect();
+
+        let mut retry_under_limit = Vec::new();
+        let mut retry_exhausted = Vec::new();
+
+        for (digest, error) in &retry_executions {
+            let retry_count = all_retry_counts.get(digest).copied().unwrap_or(0);
+            if retry_count >= config.max_retries {
+                retry_exhausted.push(*digest);
+                continue;
+            }
+            let backoff_delay = config
+                .retry_base_delay_secs
+                .saturating_mul(2u64.saturating_pow(retry_count))
+                .min(config.retry_max_delay_secs);
+            let retry_after = now + backoff_delay;
+            tracing::info!(
+                "Scheduling retry {}/{} for request digest={:x} at timestamp {}: {:.100}",
+                retry_count + 1,
+                config.max_retries,
+                digest,
+                retry_after,
+                error
+            );
+            retry_under_limit.push((*digest, error.clone(), retry_after));
+        }
+
+        if !retry_under_limit.is_empty() {
+            db.set_cycle_counts_retry_pending(&retry_under_limit).await.unwrap();
+            tracing::debug!(
+                "Updated cycle counts for {} requests with RETRY_PENDING status",
+                retry_under_limit.len()
+            );
+        }
+
+        failed_executions.extend(retry_exhausted);
         if !failed_executions.is_empty() {
             let requests_info = failed_executions
                 .iter()
                 .map(|c| {
-                    // Check executing requests first, then fall back to newly submitted requests
                     let request_id = executing_digest_to_request_id
                         .get(c)
                         .copied()
@@ -562,12 +682,52 @@ pub async fn execute_requests(db: DbObj, config: IndexerServiceExecutionConfig) 
     }
 }
 
+// When image_id is empty, fetches the image and computes the id (or uses cache); otherwise returns the existing id.
+async fn resolve_image_id(
+    image_id: &str,
+    image_url: &str,
+    cache: &ImageCache,
+    downloader: &StandardDownloader,
+) -> Result<(String, Option<Vec<u8>>), anyhow::Error> {
+    if !image_id.is_empty() {
+        return Ok((image_id.to_string(), None));
+    }
+    if let Some(id) = cache.get(image_url).await {
+        return Ok((id, None));
+    }
+    let image = downloader.download(image_url).await?;
+    let id = risc0_zkvm::compute_image_id(&image)?;
+    let id_str = id.to_string();
+    cache.insert(image_url.to_string(), id_str.clone()).await;
+    Ok((id_str, Some(image)))
+}
+
+// Returns image bytes for upload: reuses `downloaded_image` when present, else fetches from `image_url`.
+async fn image_bytes(
+    downloaded_image: Option<Vec<u8>>,
+    image_url: &str,
+    downloader: &StandardDownloader,
+) -> Result<Vec<u8>, anyhow::Error> {
+    if let Some(img) = downloaded_image {
+        return Ok(img);
+    }
+    Ok(downloader.download(image_url).await?)
+}
+
+async fn downloader_from_config(config: &IndexerServiceExecutionConfig) -> StandardDownloader {
+    StandardDownloader::from_config(StorageDownloaderConfig {
+        max_retries: Some(config.bento_retry_count.min(u8::MAX as u64) as u8),
+        ..Default::default()
+    })
+    .await
+}
+
 async fn download_or_decode_input(
-    config: &IndexerServiceExecutionConfig,
     request_id: Option<U256>,
     request_digest: B256,
     input_type: &String,
     input_data: &str,
+    downloader: &StandardDownloader,
 ) -> Result<Bytes> {
     if input_type != "Url" && input_type != "Inline" {
         return Err(anyhow!(
@@ -596,13 +756,7 @@ async fn download_or_decode_input(
             request_digest,
             decoded_url
         );
-        let input = retry(
-            config.bento_retry_count,
-            config.bento_retry_sleep_ms,
-            || async { fetch_url(&decoded_url).await },
-            "fetch_url",
-        )
-        .await?;
+        let input = downloader.download(&decoded_url).await?;
         tracing::debug!(
             "Downloaded input for request id='{}', digest={:x}",
             fmt_request_id(request_id),
@@ -630,6 +784,8 @@ async fn download_or_decode_input(
 mod tests {
     use super::*;
     use boundless_market::input::GuestEnv;
+    use boundless_test_utils::guests::{ECHO_ELF, ECHO_ID, ECHO_PATH};
+    use risc0_zkvm::sha::Digest;
     use std::time::Duration;
 
     fn test_config() -> IndexerServiceExecutionConfig {
@@ -642,7 +798,67 @@ mod tests {
             max_concurrent_executing: 5,
             max_status_queries: 20,
             max_iterations: 1,
+            max_retries: 5,
+            retry_base_delay_secs: 900,
+            retry_max_delay_secs: 14400,
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_image_id_empty() {
+        let url = format!("file://{}", ECHO_PATH);
+        let expected_id = Digest::from(ECHO_ID).to_string();
+        let cache: ImageCache = Cache::builder()
+            .eviction_policy(EvictionPolicy::lru())
+            .max_capacity(IMAGE_CACHE_MAX_ENTRIES)
+            .build();
+        let config = test_config();
+        let downloader = downloader_from_config(&config).await;
+        let result = resolve_image_id("", &url, &cache, &downloader).await;
+        assert!(result.is_ok(), "empty image_id should trigger fetch and compute");
+        let (image_id, downloaded_image) = result.unwrap();
+        assert!(!image_id.is_empty(), "image_id should be recomputed");
+        assert_eq!(image_id, expected_id);
+        let bytes = downloaded_image.expect("downloaded_image should be Some when we recompute");
+        assert_eq!(bytes.as_slice(), ECHO_ELF);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_image_id() {
+        // When image_id is set we do not fetch.
+        let existing_id = risc0_zkvm::compute_image_id(boundless_test_utils::guests::ECHO_ELF)
+            .unwrap()
+            .to_string();
+        let cache: ImageCache = Cache::builder()
+            .eviction_policy(EvictionPolicy::lru())
+            .max_capacity(IMAGE_CACHE_MAX_ENTRIES)
+            .build();
+        let config = test_config();
+        let downloader = downloader_from_config(&config).await;
+        let result =
+            resolve_image_id(&existing_id, "http://dev.null/elf", &cache, &downloader).await;
+        assert!(result.is_ok());
+        let (image_id, downloaded_image) = result.unwrap();
+        assert_eq!(image_id, existing_id);
+        assert!(downloaded_image.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_image_bytes_reuse() {
+        let bytes = vec![1u8, 2, 3, 4, 5];
+        let config = test_config();
+        let downloader = downloader_from_config(&config).await;
+        let result = image_bytes(Some(bytes.clone()), "http://dev.null/elf", &downloader).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn test_image_bytes_fetch() {
+        let config = test_config();
+        let downloader = downloader_from_config(&config).await;
+        let result = image_bytes(None, "http://dev.null/elf", &downloader).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -660,11 +876,11 @@ mod tests {
 
         // Decode it
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             &hex_input,
+            &downloader_from_config(&config).await,
         )
         .await
         .unwrap();
@@ -687,11 +903,11 @@ mod tests {
 
         // Decode it
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             &hex_input,
+            &downloader_from_config(&config).await,
         )
         .await
         .unwrap();
@@ -711,11 +927,11 @@ mod tests {
 
         // Decode it
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             &hex_input,
+            &downloader_from_config(&config).await,
         )
         .await
         .unwrap();
@@ -730,11 +946,11 @@ mod tests {
 
         // Invalid hex string
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             "0xGGGG",
+            &downloader_from_config(&config).await,
         )
         .await;
 
@@ -751,11 +967,11 @@ mod tests {
         let hex_input = format!("0x{}", hex::encode(&invalid_data));
 
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             &hex_input,
+            &downloader_from_config(&config).await,
         )
         .await;
 
@@ -769,11 +985,11 @@ mod tests {
 
         // Empty hex input (decodes to empty byte array)
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             "0x",
+            &downloader_from_config(&config).await,
         )
         .await;
 
@@ -793,11 +1009,11 @@ mod tests {
         let hex_input = format!("0x{}", hex::encode(&v0_encoded));
 
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Inline".to_string(),
             &hex_input,
+            &downloader_from_config(&config).await,
         )
         .await
         .unwrap();
@@ -832,11 +1048,11 @@ mod tests {
         let hex_url = format!("0x{}", hex::encode(url.as_bytes()));
 
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Url".to_string(),
             &hex_url,
+            &downloader_from_config(&config).await,
         )
         .await
         .unwrap();
@@ -857,11 +1073,11 @@ mod tests {
         let hex_url = format!("0x{}", hex::encode(url.as_bytes()));
 
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Url".to_string(),
             &hex_url,
+            &downloader_from_config(&config).await,
         )
         .await;
 
@@ -890,11 +1106,11 @@ mod tests {
         let hex_url = format!("0x{}", hex::encode(url.as_bytes()));
 
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Url".to_string(),
             &hex_url,
+            &downloader_from_config(&config).await,
         )
         .await;
 
@@ -908,11 +1124,11 @@ mod tests {
 
         // Invalid input type
         let result = download_or_decode_input(
-            &config,
             Some(U256::from(1)),
             request_digest,
             &"Unsupported".to_string(),
             "0x",
+            &downloader_from_config(&config).await,
         )
         .await;
 

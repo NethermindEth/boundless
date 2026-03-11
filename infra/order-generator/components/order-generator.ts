@@ -6,7 +6,7 @@ import { getServiceNameV1, Severity } from '../../util';
 import * as crypto from 'crypto';
 
 const FARGATE_CPU = 512;
-const FARGATE_MEMORY = 512;
+const FARGATE_MEMORY = 1024;
 
 interface OrderGeneratorArgs {
   chainId: string;
@@ -24,9 +24,10 @@ interface OrderGeneratorArgs {
   lockCollateralRaw: string;
   rampUp?: string;
   minPricePerMCycle: string;
-  maxPricePerMCycle: string;
+  maxPricePerMCycle?: string;
   secondsPerMCycle?: string;
   rampUpSecondsPerMCycle?: string;
+  inputMinMCycles?: string;
   inputMaxMCycles?: string;
   vpcId: pulumi.Output<string>;
   privateSubnetIds: pulumi.Output<string[]>;
@@ -47,6 +48,9 @@ interface OrderGeneratorArgs {
     // Schedule expression for the event bridge rule.
     scheduleExpression: string;
   };
+  indexerUrl: pulumi.Output<string>;
+  useZeth?: boolean;
+  maxPriceCap?: string;
 }
 
 export class OrderGenerator extends pulumi.ComponentResource {
@@ -80,6 +84,12 @@ export class OrderGenerator extends pulumi.ComponentResource {
     new aws.secretsmanager.SecretVersion(`${serviceName}-order-stream-url`, {
       secretId: orderStreamUrlSecret.id,
       secretString: offchainConfig?.orderStreamUrl ?? 'none',
+    });
+
+    const indexerUrlSecret = new aws.secretsmanager.Secret(`${serviceName}-indexer-url`);
+    new aws.secretsmanager.SecretVersion(`${serviceName}-indexer-url`, {
+      secretId: indexerUrlSecret.id,
+      secretString: args.indexerUrl,
     });
 
     const secretHash = pulumi
@@ -121,7 +131,7 @@ export class OrderGenerator extends pulumi.ComponentResource {
           {
             Effect: 'Allow',
             Action: ['secretsmanager:GetSecretValue', 'ssm:GetParameters'],
-            Resource: [privateKeySecret.arn, pinataJwtSecret.arn, rpcUrlSecret.arn, orderStreamUrlSecret.arn],
+            Resource: [privateKeySecret.arn, pinataJwtSecret.arn, rpcUrlSecret.arn, orderStreamUrlSecret.arn, indexerUrlSecret.arn],
           },
         ],
       },
@@ -153,6 +163,10 @@ export class OrderGenerator extends pulumi.ComponentResource {
         name: 'PINATA_JWT',
         valueFrom: pinataJwtSecret.arn,
       },
+      {
+        name: 'INDEXER_URL',
+        valueFrom: indexerUrlSecret.arn,
+      },
     ];
 
     if (args.autoDeposit) {
@@ -172,12 +186,14 @@ export class OrderGenerator extends pulumi.ComponentResource {
     let ogArgs = [
       `--interval ${args.interval}`,
       `--min ${args.minPricePerMCycle}`,
-      `--max ${args.maxPricePerMCycle}`,
       `--lock-collateral-raw ${args.lockCollateralRaw}`,
       `--set-verifier-address ${args.setVerifierAddr}`,
       `--boundless-market-address ${args.boundlessMarketAddr}`,
       `--tx-timeout ${args.txTimeout}`
     ]
+    if (args.maxPricePerMCycle) {
+      ogArgs.push(`--max ${args.maxPricePerMCycle}`);
+    }
     if (args.collateralTokenAddress) {
       ogArgs.push(`--collateral-token-address ${args.collateralTokenAddress}`);
     }
@@ -189,6 +205,9 @@ export class OrderGenerator extends pulumi.ComponentResource {
     }
     if (args.errorBalanceBelow) {
       ogArgs.push(`--error-balance-below ${args.errorBalanceBelow}`);
+    }
+    if (args.inputMinMCycles) {
+      ogArgs.push(`--input-min-mcycles ${args.inputMinMCycles}`);
     }
     if (args.inputMaxMCycles) {
       ogArgs.push(`--input-max-mcycles ${args.inputMaxMCycles}`);
@@ -213,6 +232,12 @@ export class OrderGenerator extends pulumi.ComponentResource {
     }
     if (args.oneShotConfig) {
       ogArgs.push(`--count ${args.oneShotConfig.count}`);
+    }
+    if (args.useZeth) {
+      ogArgs.push(`--use-zeth`);
+    }
+    if (args.maxPriceCap) {
+      ogArgs.push(`--max-price-cap ${args.maxPriceCap}`);
     }
 
     const cluster = new aws.ecs.Cluster(`${serviceName}-cluster`, { name: serviceName });

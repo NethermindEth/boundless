@@ -377,7 +377,7 @@ async fn receipt_upload(
         .await
         .context("Failed to check if object exists")?
     {
-        return Err(AppError::InputAlreadyExists(receipt_id.to_string()));
+        return Err(AppError::ReceiptAlreadyExists(receipt_id.to_string()));
     }
 
     Ok(Json(UploadRes {
@@ -399,7 +399,7 @@ async fn receipt_upload_put(
         .await
         .context("Failed to check if object exists")?
     {
-        return Err(AppError::InputAlreadyExists(receipt_id.to_string()));
+        return Err(AppError::ReceiptAlreadyExists(receipt_id.to_string()));
     }
 
     // TODO: Support streaming uploads
@@ -659,9 +659,28 @@ async fn blake3_groth16_status(
     Path(job_id): Path<Uuid>,
     Host(hostname): Host,
 ) -> Result<Json<SnarkStatusRes>, AppError> {
-    let job_state = taskdb::get_job_state(&state.db_pool, &job_id, &api_key)
-        .await
-        .context("Failed to get job state")?;
+    let job_state_result = taskdb::get_job_state(&state.db_pool, &job_id, &api_key).await;
+
+    // If job not found in taskdb, check MinIO for completed receipt
+    if let Err(TaskDbErr::SqlError(sqlx::Error::RowNotFound)) = &job_state_result {
+        let receipt_key =
+            format!("{RECEIPT_BUCKET_DIR}/{BLAKE3_GROTH16_BUCKET_DIR}/{job_id}.bincode");
+        if state
+            .s3_client
+            .object_exists(&receipt_key)
+            .await
+            .context("Failed to check if receipt exists")?
+        {
+            // Receipt exists - job was completed and cleaned up from taskdb
+            return Ok(Json(SnarkStatusRes {
+                status: JobState::Done.to_string(),
+                error_msg: None,
+                output: Some(format!("http://{hostname}/receipts/shrink_bitvm2/receipt/{job_id}")),
+            }));
+        }
+    }
+    let job_state = job_state_result.context("Failed to get job state")?;
+
     let (error_msg, output) = match job_state {
         JobState::Running => (None, None),
         JobState::Done => {

@@ -25,10 +25,16 @@ export interface MarketIndexerArgs {
   bentoApiUrl?: pulumi.Output<string>;
   bentoApiKey?: pulumi.Output<string>;
   rustLogLevel: string;
+  blockDelay?: pulumi.Input<string>;
+  backfillChainDataBlocks?: pulumi.Input<string>;
+  chainDataBatchDelayMs?: pulumi.Input<string>;
+  backfillBatchSize?: pulumi.Input<string>;
 }
 
 export class MarketIndexer extends pulumi.ComponentResource {
   public readonly backfillLambdaName: pulumi.Output<string>;
+  public readonly image: docker_build.Image;
+  public readonly service: awsx.ecs.FargateService;
 
   constructor(name: string, args: MarketIndexerArgs, opts?: pulumi.ComponentResourceOptions) {
     super('indexer:market', name, opts);
@@ -52,6 +58,10 @@ export class MarketIndexer extends pulumi.ComponentResource {
       bentoApiUrl,
       bentoApiKey,
       rustLogLevel,
+      blockDelay,
+      backfillChainDataBlocks,
+      chainDataBatchDelayMs,
+      backfillBatchSize,
     } = args;
 
     const serviceName = name;
@@ -70,7 +80,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
       };
     }
 
-    const marketImage = new docker_build.Image(`${serviceName}-market-img-${infra.databaseVersion}`, {
+    this.image = new docker_build.Image(`${serviceName}-market-img-${infra.databaseVersion}`, {
       tags: [pulumi.interpolate`${infra.ecrRepository.repository.repositoryUrl}:market-${dockerTag}-${infra.databaseVersion}`],
       context: {
         location: dockerDir,
@@ -126,7 +136,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
       }, { parent: this });
     }));
 
-    const marketService = new awsx.ecs.FargateService(`${serviceName}-market-indexer-${infra.databaseVersion}`, {
+    this.service = new awsx.ecs.FargateService(`${serviceName}-market-indexer-${infra.databaseVersion}`, {
       name: `${serviceName}-market-indexer-${infra.databaseVersion}`,
       cluster: infra.cluster.arn,
       networkConfiguration: {
@@ -149,7 +159,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
         taskRole: { roleArn: infra.taskRole.arn },
         container: {
           name: `${serviceName}-market-${infra.databaseVersion}`,
-          image: marketImage.ref,
+          image: this.image.ref,
           cpu: 2048,
           memory: 2048,
           essential: true,
@@ -177,6 +187,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
             ...(orderStreamApiKey ? ['--order-stream-api-key', orderStreamApiKey] : []),
             ...(bentoApiUrl ? ['--bento-api-url', bentoApiUrl] : []),
             ...(bentoApiKey ? ['--bento-api-key', bentoApiKey] : []),
+            ...(blockDelay ? ['--block-delay', blockDelay] : []),
           ],
           secrets: [
             {
@@ -308,7 +319,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
       ),
     }, { parent: this });
 
-    // Create Lambda function
+    // Create Lambda function for aggregates backfill
     const backfillLambda = new aws.lambda.Function(`${serviceName}-backfill-start`, {
       name: `${serviceName}-backfill-start`,
       role: lambdaRole.arn,
@@ -330,8 +341,37 @@ export class MarketIndexer extends pulumi.ComponentResource {
           BOUNDLESS_ADDRESS: boundlessAddress,
           CACHE_BUCKET: infra.cacheBucket.bucket,
           // Scheduled backfill configuration
-          SCHEDULED_BACKFILL_MODE: 'statuses_and_aggregates', // Default to aggregates for daily runs
-          START_BLOCK: startBlock, // Use same start block as regular indexer
+          SCHEDULED_BACKFILL_MODE: 'statuses_and_aggregates',
+          START_BLOCK: startBlock,
+        },
+      },
+    }, { parent: this, dependsOn: [lambdaRole] });
+
+    // Create Lambda function for chain data backfill (with lookback support)
+    const chainDataBackfillLambda = new aws.lambda.Function(`${serviceName}-chain-backfill-start`, {
+      name: `${serviceName}-chain-backfill-start`,
+      role: lambdaRole.arn,
+      runtime: 'nodejs20.x',
+      handler: 'index.handler',
+      timeout: 30,
+      code: new pulumi.asset.AssetArchive({
+        '.': new pulumi.asset.FileArchive('../indexer/backfill-trigger-lambda/build'),
+      }),
+      environment: {
+        variables: {
+          CLUSTER_ARN: infra.cluster.arn,
+          TASK_DEFINITION_ARN: backfillTaskDef.taskDefinition.arn,
+          SUBNET_IDS: privSubNetIds.apply(ids => ids.join(',')),
+          SECURITY_GROUP_ID: infra.indexerSecurityGroup.id,
+          CONTAINER_NAME: backfillContainerName,
+          RPC_URL: ethRpcUrl,
+          LOGS_RPC_URL: logsEthRpcUrl ?? ethRpcUrl,
+          BOUNDLESS_ADDRESS: boundlessAddress,
+          CACHE_BUCKET: infra.cacheBucket.bucket,
+          SCHEDULED_BACKFILL_MODE: 'chain_data',
+          LOOKBACK_BLOCKS: backfillChainDataBlocks ?? '100000',
+          CHAIN_DATA_BATCH_DELAY_MS: chainDataBatchDelayMs ?? '2500',
+          BACKFILL_BATCH_SIZE: backfillBatchSize ?? '750',
         },
       },
     }, { parent: this, dependsOn: [lambdaRole] });
@@ -364,6 +404,146 @@ export class MarketIndexer extends pulumi.ComponentResource {
       arn: backfillLambda.arn,
     }, { parent: this });
 
+    // Create EventBridge rule for daily chain data backfill
+    const chainDataBackfillRule = new aws.cloudwatch.EventRule(`${serviceName}-chain-backfill-rule`, {
+      name: `${serviceName}-chain-backfill-rule`,
+      description: `Daily chain data backfill for ${serviceName}`,
+      scheduleExpression: 'cron(0 18 * * ? *)', // Run daily at 6 PM UTC
+      state: 'ENABLED',
+    }, { parent: this });
+
+    // Grant EventBridge permission to invoke chain data backfill Lambda
+    new aws.lambda.Permission(`${serviceName}-chain-backfill-lmbd-perm`, {
+      statementId: `AllowEventBridge-${serviceName}-chain`,
+      action: 'lambda:InvokeFunction',
+      function: chainDataBackfillLambda.name,
+      principal: 'events.amazonaws.com',
+      sourceArn: chainDataBackfillRule.arn,
+    }, { parent: this });
+
+    // Add Lambda as target for chain data EventBridge rule
+    new aws.cloudwatch.EventTarget(`${serviceName}-chain-backfill-targ`, {
+      rule: chainDataBackfillRule.name,
+      arn: chainDataBackfillLambda.arn,
+    }, { parent: this });
+
+    // Market efficiency indexer: run once daily with 2-day lookback
+    const efficiencyImage = new docker_build.Image(`${serviceName}-efficiency-img-${infra.databaseVersion}`, {
+      tags: [pulumi.interpolate`${infra.ecrRepository.repository.repositoryUrl}:market-efficiency-${dockerTag}-${infra.databaseVersion}`],
+      context: { location: dockerDir },
+      platforms: ['linux/amd64'],
+      push: true,
+      dockerfile: { location: `${dockerDir}/dockerfiles/market-efficiency-indexer.dockerfile` },
+      builder: dockerRemoteBuilder ? { name: dockerRemoteBuilder } : undefined,
+      buildArgs: { S3_CACHE_PREFIX: 'private/boundless/rust-cache-docker-Linux-X64/sccache' },
+      secrets: buildSecrets,
+      cacheFrom: [{ registry: { ref: pulumi.interpolate`${infra.ecrRepository.repository.repositoryUrl}:cache` } }],
+      cacheTo: [{ registry: { mode: docker_build.CacheMode.Max, imageManifest: true, ociMediaTypes: true, ref: pulumi.interpolate`${infra.ecrRepository.repository.repositoryUrl}:cache` } }],
+      registries: [{ address: infra.ecrRepository.repository.repositoryUrl, password: infra.ecrAuthToken.apply(t => t.password), username: infra.ecrAuthToken.apply(t => t.userName) }],
+    }, { parent: this });
+
+    const efficiencyLogGroupName = `${serviceName}-market-efficiency`;
+    const efficiencyLogGroup = new aws.cloudwatch.LogGroup(efficiencyLogGroupName, {
+      name: efficiencyLogGroupName,
+      retentionInDays: 0,
+      skipDestroy: true,
+    }, { parent: this });
+
+    const efficiencyLogGroupArn = pulumi.interpolate`arn:aws:logs:${region}:${accountId}:log-group:${efficiencyLogGroupName}:*`;
+    new aws.iam.RolePolicy(`${serviceName}-efficiency-logs-policy`, {
+      role: infra.executionRole.id,
+      policy: {
+        Version: '2012-10-17',
+        Statement: [{
+          Effect: 'Allow',
+          Action: ['logs:CreateLogStream', 'logs:PutLogEvents'],
+          Resource: efficiencyLogGroupArn,
+        }],
+      },
+    }, { parent: this });
+
+    const efficiencyContainerName = `${serviceName}-market-efficiency-${infra.databaseVersion}`;
+    const efficiencyTaskDef = new awsx.ecs.FargateTaskDefinition(`${serviceName}-market-efficiency-task-${infra.databaseVersion}`, {
+      family: `${serviceName}-market-efficiency-${infra.databaseVersion}`,
+      logGroup: { existing: efficiencyLogGroup },
+      executionRole: { roleArn: infra.executionRole.arn },
+      taskRole: { roleArn: infra.taskRole.arn },
+      container: {
+        name: efficiencyContainerName,
+        image: efficiencyImage.ref,
+        cpu: 1024,
+        memory: 2048,
+        essential: true,
+        linuxParameters: { initProcessEnabled: true },
+        command: ['--once', '--lookback-days', '2', '--log-json'],
+        secrets: [{ name: 'DATABASE_URL', valueFrom: infra.dbUrlSecret.arn }],
+        environment: [
+          { name: 'RUST_LOG', value: 'info' },
+          { name: 'NO_COLOR', value: '1' },
+          { name: 'RUST_BACKTRACE', value: '1' },
+          { name: 'SECRET_HASH', value: infra.secretHash },
+          { name: 'AWS_REGION', value: 'us-west-2' },
+        ],
+      },
+    }, { parent: this, dependsOn: [infra.taskRole, infra.taskRolePolicyAttachment] });
+
+    const efficiencyLambdaRole = new aws.iam.Role(`${serviceName}-efficiency-lambda-role`, {
+      assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({ Service: 'lambda.amazonaws.com' }),
+      managedPolicyArns: [aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole],
+    }, { parent: this });
+
+    new aws.iam.RolePolicy(`${serviceName}-efficiency-lambda-policy`, {
+      role: efficiencyLambdaRole.id,
+      policy: pulumi.all([efficiencyTaskDef.taskDefinition.arn, infra.executionRole.arn, infra.taskRole.arn]).apply(
+        ([taskDefArn, execRoleArn, taskRoleArn]) => JSON.stringify({
+          Version: '2012-10-17',
+          Statement: [
+            { Effect: 'Allow', Action: ['ecs:RunTask'], Resource: taskDefArn.replace(/:\d+$/, ':*') },
+            { Effect: 'Allow', Action: ['iam:PassRole'], Resource: [execRoleArn, taskRoleArn] },
+          ],
+        })
+      ),
+    }, { parent: this });
+
+    const efficiencyTriggerLambda = new aws.lambda.Function(`${serviceName}-market-efficiency-trigger`, {
+      name: `${serviceName}-market-efficiency-trigger`,
+      role: efficiencyLambdaRole.arn,
+      runtime: 'nodejs20.x',
+      handler: 'index.handler',
+      timeout: 30,
+      code: new pulumi.asset.AssetArchive({
+        '.': new pulumi.asset.FileArchive('../indexer/market-efficiency-trigger-lambda/build'),
+      }),
+      environment: {
+        variables: {
+          CLUSTER_ARN: infra.cluster.arn,
+          TASK_DEFINITION_ARN: efficiencyTaskDef.taskDefinition.arn,
+          SUBNET_IDS: privSubNetIds.apply(ids => ids.join(',')),
+          SECURITY_GROUP_ID: infra.indexerSecurityGroup.id,
+        },
+      },
+    }, { parent: this, dependsOn: [efficiencyLambdaRole] });
+
+    const efficiencyScheduleRule = new aws.cloudwatch.EventRule(`${serviceName}-market-efficiency-rule`, {
+      name: `${serviceName}-market-efficiency-rule`,
+      description: `Daily market efficiency analysis for ${serviceName} (2-day lookback)`,
+      scheduleExpression: 'cron(0 4 * * ? *)', // Run daily at 4 AM UTC
+      state: 'ENABLED',
+    }, { parent: this });
+
+    new aws.lambda.Permission(`${serviceName}-efficiency-lmbd-perm`, {
+      statementId: `AllowEventBridge-${serviceName}-efficiency`,
+      action: 'lambda:InvokeFunction',
+      function: efficiencyTriggerLambda.name,
+      principal: 'events.amazonaws.com',
+      sourceArn: efficiencyScheduleRule.arn,
+    }, { parent: this });
+
+    new aws.cloudwatch.EventTarget(`${serviceName}-market-efficiency-targ`, {
+      rule: efficiencyScheduleRule.name,
+      arn: efficiencyTriggerLambda.arn,
+    }, { parent: this });
+
     // Grant execution role permission to write to this service's specific log group
     const logGroupArn = pulumi.interpolate`arn:aws:logs:${region}:${accountId}:log-group:${serviceLogGroupName}:*`;
 
@@ -394,7 +574,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
         defaultValue: '0',
       },
       pattern: `"ERROR "`,
-    }, { parent: this, dependsOn: [marketService] });
+    }, { parent: this, dependsOn: [this.service] });
 
     new aws.cloudwatch.MetricAlarm(`${serviceName}-market-error-alarm-${Severity.SEV2}`, {
       name: `${serviceName}-market-log-err-${Severity.SEV2}`,
@@ -431,7 +611,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
         defaultValue: '0',
       },
       pattern: 'FATAL',
-    }, { parent: this, dependsOn: [marketService] });
+    }, { parent: this, dependsOn: [this.service] });
 
     new aws.cloudwatch.MetricAlarm(`${serviceName}-market-fatal-alarm-${Severity.SEV2}`, {
       name: `${serviceName}-market-log-fatal-${Severity.SEV2}`,
@@ -468,7 +648,7 @@ export class MarketIndexer extends pulumi.ComponentResource {
         defaultValue: '0',
       },
       pattern: 'panicked',
-    }, { parent: this, dependsOn: [marketService] });
+    }, { parent: this, dependsOn: [this.service] });
 
     new aws.cloudwatch.MetricAlarm(`${serviceName}-market-panicked-alarm-${Severity.SEV2}`, {
       name: `${serviceName}-market-log-panicked-${Severity.SEV2}`,
@@ -494,6 +674,9 @@ export class MarketIndexer extends pulumi.ComponentResource {
       alarmActions,
     }, { parent: this });
 
-    this.registerOutputs({});
+    this.registerOutputs({
+      imageRef: this.image.ref,
+      serviceUrn: this.service.urn,
+    });
   }
 }

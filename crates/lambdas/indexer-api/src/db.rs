@@ -14,9 +14,11 @@
 
 use anyhow::Result;
 use boundless_indexer::db::{
+    efficiency::{EfficiencyDbImpl, EfficiencyDbObj},
     market::{DbObj as MarketDbObj, MarketDb},
     rewards::{RewardsDb, RewardsDbObj},
 };
+use boundless_indexer::market::epoch_calculator::EpochCalculator;
 use sqlx::postgres::PgPoolOptions;
 use std::{sync::Arc, time::Duration};
 
@@ -24,7 +26,9 @@ use std::{sync::Arc, time::Duration};
 pub struct AppState {
     pub rewards_db: RewardsDbObj,
     pub market_db: MarketDbObj,
+    pub efficiency_db: EfficiencyDbObj,
     pub chain_id: u64,
+    pub epoch_calculator: EpochCalculator,
 }
 
 impl AppState {
@@ -48,8 +52,15 @@ impl AppState {
         let market_db = MarketDb::new(database_url, Some(lambda_pool_options), true).await?;
         let market_db: MarketDbObj = Arc::new(market_db);
 
+        // Create efficiency database connection (skip migrations for reader endpoint)
+        let efficiency_db =
+            EfficiencyDbImpl::new(database_url, Some(Duration::from_secs(5)), false).await?;
+        let efficiency_db: EfficiencyDbObj = Arc::new(efficiency_db);
+
         tracing::info!("Database connection established");
 
-        Ok(Self { rewards_db, market_db, chain_id })
+        let epoch_calculator = EpochCalculator::with_default();
+
+        Ok(Self { rewards_db, market_db, efficiency_db, chain_id, epoch_calculator })
     }
 }
