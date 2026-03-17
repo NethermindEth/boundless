@@ -45,7 +45,7 @@ risc0-ethereum-contracts = { workspace = true, optional = true }
 risc0-povw = { workspace = true, features = ["guest"] }
 risc0-steel = { git = "https://github.com/boundless-xyz/steel", branch = "release-2.4" }
 risc0-zkvm = { workspace = true, features = ["client", "unstable"], optional = true }
-ruint = { version = "1.15", default-features = false, features = ["borsh", "std"] }
+ruint = { version = "1.17", default-features = false, features = ["borsh", "std"] }
 serde = "1"
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 url = { workspace = true, optional = true }
