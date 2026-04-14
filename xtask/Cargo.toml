@@ -13,7 +13,7 @@ cuda = ["dep:risc0-groth16-sys", "blake3_groth16/cuda"]
 
 [dependencies]
 anyhow = "1.0"
-astral-tokio-tar = { version = "0.5" }
+astral-tokio-tar = { version = "0.6" }
 async-compression = { version = "0.4", default-features = false, features = ["lzma", "tokio"] }
 aws-config = "1.0"
 aws-credential-types = "1.0"
