@@ -69,7 +69,7 @@ utoipa-swagger-ui = { version = "8", features = ["axum"] }
 # Command assertion for integration tests
 assert_cmd = "=2.0"
 # Random number generation for tests
-rand = "0.8"
+rand = "0.9"
 # HTTP client for integration tests
 reqwest = { workspace = true, features = ["json"] }
 # Temporary file handling for tests
